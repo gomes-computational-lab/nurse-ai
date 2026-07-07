@@ -16,6 +16,15 @@ class OllamaClient:
         self.host = host.rstrip("/")
         self.timeout = timeout
 
+    def warmup(self) -> None:
+        self.chat(
+            [
+                {"role": "system", "content": "Reply with OK."},
+                {"role": "user", "content": "OK"},
+            ],
+            temperature=0.0,
+        )
+
     def chat(
         self,
         messages: list[dict[str, str]],
@@ -52,4 +61,3 @@ class OllamaClient:
             return data["message"]["content"].strip()
         except (json.JSONDecodeError, KeyError) as exc:
             raise OllamaError(f"Unexpected Ollama response: {raw[:500]}") from exc
-

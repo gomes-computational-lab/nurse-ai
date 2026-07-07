@@ -54,6 +54,7 @@ def main() -> None:
     client = OllamaClient(model=args.model, host=args.host)
     session = SimulationSession(scenario, client)
     stt_preload = _start_stt_preload(args.stt_model)
+    ollama_preload = _start_ollama_preload(client)
 
     print(f"\nScenario: {scenario.title}")
     print(f"Setting: {scenario.setting}")
@@ -64,6 +65,7 @@ def main() -> None:
         opening_latencies: dict[str, float] = {}
         saved_latency: dict[str, Any] = {"opening": opening_latencies, "turns": []}
 
+        _await_ollama_preload(ollama_preload)
         patient_text = _time_step("generation", opening_latencies, session.opening)
         print(f"{scenario.role}: {patient_text}\n")
         _time_step("speech", opening_latencies, speak_text, patient_text)
@@ -158,6 +160,31 @@ def _print_latency_summary(latencies: dict[str, float]) -> None:
 
 def _serialize_latencies(latencies: dict[str, float]) -> dict[str, float]:
     return {name: round(value, 3) for name, value in latencies.items()}
+
+
+def _start_ollama_preload(client: OllamaClient) -> dict[str, Any]:
+    preload_state: dict[str, Any] = {"error": None}
+
+    def target() -> None:
+        try:
+            client.warmup()
+        except BaseException as exc:
+            preload_state["error"] = exc
+
+    preload_state["thread"] = threading.Thread(target=target, daemon=True)
+    preload_state["thread"].start()
+    return preload_state
+
+
+def _await_ollama_preload(preload_state: dict[str, Any]) -> None:
+    thread = preload_state.get("thread")
+    if thread is not None:
+        thread.join()
+        preload_state["thread"] = None
+
+    error = preload_state.get("error")
+    if error is not None:
+        raise error
 
 
 def _start_stt_preload(model_name: str) -> dict[str, Any]:
