@@ -22,7 +22,7 @@ from sim.speech_to_text import (
 )
 from sim.storage import save_result
 from sim.terminal_ui import choose_scenario, print_feedback, print_scenarios
-from sim.text_to_speech import speak_text, stop_speaking
+from sim.text_to_speech import create_speech_stream, stop_speaking
 
 
 DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
@@ -67,9 +67,15 @@ def main() -> None:
 
         _await_ollama_preload(ollama_preload)
         _print_role_prefix(scenario.role)
-        patient_text = _time_step("generation", opening_latencies, session.opening, _print_stream_chunk)
+        opening_speech_stream = create_speech_stream()
+        patient_text = _time_step(
+            "generation",
+            opening_latencies,
+            session.opening,
+            _stream_patient_chunk(opening_speech_stream),
+        )
         _finish_streamed_response()
-        _time_step("speech", opening_latencies, speak_text, patient_text)
+        _time_step("speech", opening_latencies, opening_speech_stream.finish)
         saved_latency["opening"] = _serialize_latencies(opening_latencies)
         _print_latency_summary(opening_latencies)
 
@@ -121,9 +127,16 @@ def main() -> None:
             print(f"\nStudent: {transcript}\n")
 
             _print_role_prefix(scenario.role)
-            patient_text = _time_step("generation", turn_latencies, session.respond, transcript, _print_stream_chunk)
+            speech_stream = create_speech_stream()
+            patient_text = _time_step(
+                "generation",
+                turn_latencies,
+                session.respond,
+                transcript,
+                _stream_patient_chunk(speech_stream),
+            )
             _finish_streamed_response()
-            _time_step("speech", turn_latencies, speak_text, patient_text)
+            _time_step("speech", turn_latencies, speech_stream.finish)
             saved_latency["turns"].append(
                 {
                     "turn": len(saved_latency["turns"]) + 1,
@@ -171,6 +184,14 @@ def _print_role_prefix(role: str) -> None:
 
 def _print_stream_chunk(chunk: str) -> None:
     print(chunk, end="", flush=True)
+
+
+def _stream_patient_chunk(speech_stream):
+    def callback(chunk: str) -> None:
+        _print_stream_chunk(chunk)
+        speech_stream.add_chunk(chunk)
+
+    return callback
 
 
 def _finish_streamed_response() -> None:
