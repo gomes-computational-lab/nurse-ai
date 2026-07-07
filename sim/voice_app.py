@@ -66,8 +66,9 @@ def main() -> None:
         saved_latency: dict[str, Any] = {"opening": opening_latencies, "turns": []}
 
         _await_ollama_preload(ollama_preload)
-        patient_text = _time_step("generation", opening_latencies, session.opening)
-        print(f"{scenario.role}: {patient_text}\n")
+        _print_role_prefix(scenario.role)
+        patient_text = _time_step("generation", opening_latencies, session.opening, _print_stream_chunk)
+        _finish_streamed_response()
         _time_step("speech", opening_latencies, speak_text, patient_text)
         saved_latency["opening"] = _serialize_latencies(opening_latencies)
         _print_latency_summary(opening_latencies)
@@ -119,8 +120,9 @@ def main() -> None:
 
             print(f"\nStudent: {transcript}\n")
 
-            patient_text = _time_step("generation", turn_latencies, session.respond, transcript)
-            print(f"{scenario.role}: {patient_text}\n")
+            _print_role_prefix(scenario.role)
+            patient_text = _time_step("generation", turn_latencies, session.respond, transcript, _print_stream_chunk)
+            _finish_streamed_response()
             _time_step("speech", turn_latencies, speak_text, patient_text)
             saved_latency["turns"].append(
                 {
@@ -161,6 +163,18 @@ def _print_latency_summary(latencies: dict[str, float]) -> None:
 
 def _serialize_latencies(latencies: dict[str, float]) -> dict[str, float]:
     return {name: round(value, 3) for name, value in latencies.items()}
+
+
+def _print_role_prefix(role: str) -> None:
+    print(f"{role}: ", end="", flush=True)
+
+
+def _print_stream_chunk(chunk: str) -> None:
+    print(chunk, end="", flush=True)
+
+
+def _finish_streamed_response() -> None:
+    print("\n")
 
 
 def _start_ollama_preload(client: OllamaClient) -> dict[str, Any]:

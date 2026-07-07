@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Callable
+
 from sim.models import Message, Scenario
 from sim.ollama_client import OllamaClient
 
@@ -10,14 +12,14 @@ class SimulationSession:
         self.client = client
         self.transcript: list[Message] = []
 
-    def opening(self) -> str:
-        response = self.client.chat(self._patient_messages(), temperature=0.75)
+    def opening(self, on_chunk: Callable[[str], None] | None = None) -> str:
+        response = self.client.chat(self._patient_messages(), temperature=0.75, on_chunk=on_chunk)
         self.transcript.append(Message(role="patient", content=response))
         return response
 
-    def respond(self, student_response: str) -> str:
+    def respond(self, student_response: str, on_chunk: Callable[[str], None] | None = None) -> str:
         self.transcript.append(Message(role="student", content=student_response))
-        response = self.client.chat(self._patient_messages(), temperature=0.75)
+        response = self.client.chat(self._patient_messages(), temperature=0.75, on_chunk=on_chunk)
         self.transcript.append(Message(role="patient", content=response))
         return response
 
@@ -71,4 +73,3 @@ Reveal clinical information only if the student asks appropriate questions or pr
 Do not provide coaching, scoring, or meta-commentary during the conversation.
 If the student says something unsafe, react realistically with concern, confusion, fear, or resistance.
 """.strip()
-

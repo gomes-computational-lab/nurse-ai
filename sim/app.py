@@ -41,8 +41,9 @@ def main() -> None:
     print("Type /help for commands.\n")
 
     try:
-        patient_text = session.opening()
-        print(f"{scenario.role}: {patient_text}\n")
+        _print_role_prefix(scenario.role)
+        patient_text = session.opening(on_chunk=_print_stream_chunk)
+        _finish_streamed_response()
 
         while True:
             student_text = input("Student: ").strip()
@@ -58,8 +59,9 @@ def main() -> None:
             if student_text == "/end":
                 break
 
-            patient_text = session.respond(student_text)
-            print(f"\n{scenario.role}: {patient_text}\n")
+            _print_role_prefix(scenario.role)
+            patient_text = session.respond(student_text, on_chunk=_print_stream_chunk)
+            _finish_streamed_response()
 
         print("\nEvaluating student performance...\n")
         feedback = evaluate_transcript(scenario, session.transcript, client)
@@ -79,3 +81,15 @@ def _print_help() -> None:
     print("  /end   End simulation and generate feedback")
     print("  /quit  Exit and save transcript without feedback")
     print("  /help  Show this help\n")
+
+
+def _print_role_prefix(role: str) -> None:
+    print(f"{role}: ", end="", flush=True)
+
+
+def _print_stream_chunk(chunk: str) -> None:
+    print(chunk, end="", flush=True)
+
+
+def _finish_streamed_response() -> None:
+    print("\n")
