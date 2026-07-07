@@ -22,7 +22,7 @@ from sim.speech_to_text import (
 )
 from sim.storage import save_result
 from sim.terminal_ui import choose_scenario, print_feedback, print_scenarios
-from sim.text_to_speech import speak_text
+from sim.text_to_speech import speak_text, stop_speaking
 
 
 DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
@@ -81,6 +81,7 @@ def main() -> None:
             if action == "end":
                 break
 
+            stop_speaking()
             print("\nRecording... press Space to stop.\n")
             turn_latencies: dict[str, float] = {}
 
