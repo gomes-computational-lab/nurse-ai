@@ -15,6 +15,7 @@ def save_result(
     scenario: Scenario,
     transcript: list[Message],
     feedback: dict[str, Any] | None = None,
+    latency: dict[str, Any] | None = None,
 ) -> Path:
     TRANSCRIPT_DIR.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -29,6 +30,7 @@ def save_result(
         "transcript": [message.__dict__ for message in transcript],
         "feedback": feedback,
     }
+    if latency is not None:
+        payload["latency"] = latency
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return path
-

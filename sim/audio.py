@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import wave
 from pathlib import Path
 
@@ -14,6 +15,47 @@ class AudioRecordingError(RuntimeError):
 
 class AudioDependencyError(AudioRecordingError):
     pass
+
+
+def record_microphone_until_stopped(
+    stop_event: threading.Event,
+    *,
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
+    channels: int = 1,
+) -> Path:
+    try:
+        import sounddevice as sd
+    except ImportError as exc:
+        raise AudioDependencyError(
+            "Missing audio dependency `sounddevice`. Install requirements with `pip install -r requirements.txt`."
+        ) from exc
+
+    frames: list[object] = []
+
+    def capture(indata, frame_count, time_info, status) -> None:
+        del frame_count, time_info, status
+        frames.append(indata.copy())
+
+    try:
+        with sd.InputStream(samplerate=sample_rate, channels=channels, dtype="int16", callback=capture):
+            stop_event.wait()
+    except Exception as exc:
+        raise AudioRecordingError(
+            "Microphone recording failed. Check microphone permissions and the default input device."
+        ) from exc
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+        temp_path = Path(temp_file.name)
+
+    audio_bytes = b"".join(frame.tobytes() for frame in frames)
+
+    with wave.open(str(temp_path), "wb") as wav_file:
+        wav_file.setnchannels(channels)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(audio_bytes)
+
+    return temp_path
 
 
 def record_microphone_clip(

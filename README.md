@@ -59,10 +59,10 @@ python3 main.py --scenario post_op_pain
 python3 voice_demo.py
 ```
 
-Run a specific scenario with a shorter recording window:
+Run a specific scenario:
 
 ```bash
-python3 voice_demo.py --scenario post_op_pain --record-seconds 4
+python3 voice_demo.py --scenario post_op_pain
 ```
 
 Change the Ollama model or faster-whisper model:
@@ -73,13 +73,14 @@ python3 voice_demo.py --model llama3.1 --stt-model tiny.en
 
 Voice demo behavior:
 
-- press Enter to record a fixed-length microphone clip
+- press `Space` to start recording
+- press `Space` again to stop recording and transcribe
 - type `/end` and press Enter to evaluate and save the transcript
 - type `/quit` and press Enter to exit without evaluation
 
 On macOS, patient responses are spoken with the built-in `say` command. On other systems, the demo continues with printed output only and shows a one-time TTS warning.
 
-This is an early prototype. Recording is fixed-length, fully local, and non-streaming.
+This is an early prototype. Recording is fully local and non-streaming.
 
 Transcripts and feedback are saved in `transcripts/`.
 

@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import threading
 import time
 from pathlib import Path
+from typing import Any
 
-from sim.audio import AudioDependencyError, AudioRecordingError, record_microphone_clip
+from sim.audio import AudioDependencyError, AudioRecordingError, record_microphone_until_stopped
 from sim.evaluator import evaluate_transcript
 from sim.ollama_client import OllamaClient, OllamaError
 from sim.scenarios import load_scenario
@@ -18,7 +20,6 @@ from sim.text_to_speech import speak_text
 
 
 DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
-DEFAULT_RECORD_SECONDS = 5.0
 
 
 def main() -> None:
@@ -27,12 +28,6 @@ def main() -> None:
     parser.add_argument("--host", default="http://localhost:11434", help="Ollama host URL.")
     parser.add_argument("--scenario", default=None, help="Scenario ID to run.")
     parser.add_argument("--list", action="store_true", help="List available scenarios and exit.")
-    parser.add_argument(
-        "--record-seconds",
-        type=float,
-        default=DEFAULT_RECORD_SECONDS,
-        help=f"Fixed microphone recording duration in seconds. Default: {DEFAULT_RECORD_SECONDS}",
-    )
     parser.add_argument(
         "--stt-model",
         default=DEFAULT_STT_MODEL,
@@ -43,10 +38,6 @@ def main() -> None:
     if args.list:
         print_scenarios()
         return
-
-    if args.record_seconds <= 0:
-        print("Error: --record-seconds must be greater than zero.", file=sys.stderr)
-        raise SystemExit(1)
 
     try:
         scenario = load_scenario(args.scenario) if args.scenario else choose_scenario()
@@ -59,33 +50,33 @@ def main() -> None:
 
     print(f"\nScenario: {scenario.title}")
     print(f"Setting: {scenario.setting}")
-    print(f"Voice recording length: {args.record_seconds:.1f} seconds")
-    print("Press Enter to record, or type /end or /quit.\n")
+    print("Press Space to start recording and Space again to stop.")
+    print("Type /end or /quit, then press Enter.\n")
 
     try:
-        latencies: dict[str, float] = {}
-        patient_text = _time_step("generation", latencies, session.opening)
+        opening_latencies: dict[str, float] = {}
+        saved_latency: dict[str, Any] = {"opening": opening_latencies, "turns": []}
+
+        patient_text = _time_step("generation", opening_latencies, session.opening)
         print(f"{scenario.role}: {patient_text}\n")
-        _time_step("speech", latencies, speak_text, patient_text)
-        _print_latency_summary(latencies)
+        _time_step("speech", opening_latencies, speak_text, patient_text)
+        saved_latency["opening"] = _serialize_latencies(opening_latencies)
+        _print_latency_summary(opening_latencies)
 
         while True:
-            command = input("Command: ").strip()
-            if command == "/quit":
-                path = save_result(scenario, session.transcript)
+            action = _read_voice_action()
+            if action == "quit":
+                path = save_result(scenario, session.transcript, latency=saved_latency)
                 print(f"\nSaved transcript without feedback: {path}")
                 return
-            if command == "/end":
+            if action == "end":
                 break
-            if command:
-                print("Press Enter to record, or type /end or /quit.")
-                continue
 
-            print(f"\nRecording for {args.record_seconds:.1f} seconds...")
+            print("\nRecording... press Space to stop.\n")
             turn_latencies: dict[str, float] = {}
 
             try:
-                audio_path = _time_step("recording", turn_latencies, record_microphone_clip, args.record_seconds)
+                audio_path = _time_step("recording", turn_latencies, _record_until_space)
             except AudioDependencyError as exc:
                 print(f"\nError: {exc}", file=sys.stderr)
                 raise SystemExit(1)
@@ -120,15 +111,21 @@ def main() -> None:
             patient_text = _time_step("generation", turn_latencies, session.respond, transcript)
             print(f"{scenario.role}: {patient_text}\n")
             _time_step("speech", turn_latencies, speak_text, patient_text)
+            saved_latency["turns"].append(
+                {
+                    "turn": len(saved_latency["turns"]) + 1,
+                    "latency": _serialize_latencies(turn_latencies),
+                }
+            )
             _print_latency_summary(turn_latencies)
 
         print("\nEvaluating student performance...\n")
         feedback = evaluate_transcript(scenario, session.transcript, client)
-        path = save_result(scenario, session.transcript, feedback)
+        path = save_result(scenario, session.transcript, feedback, latency=saved_latency)
         print_feedback(feedback)
         print(f"\nSaved transcript and feedback: {path}")
     except KeyboardInterrupt:
-        path = save_result(scenario, session.transcript)
+        path = save_result(scenario, session.transcript, latency=saved_latency)
         print(f"\nInterrupted. Saved transcript without feedback: {path}")
     except OllamaError as exc:
         print(f"\nOllama error: {exc}", file=sys.stderr)
@@ -151,8 +148,183 @@ def _print_latency_summary(latencies: dict[str, float]) -> None:
     print(f"Latency | {' | '.join(parts)}\n")
 
 
+def _serialize_latencies(latencies: dict[str, float]) -> dict[str, float]:
+    return {name: round(value, 3) for name, value in latencies.items()}
+
+
 def _cleanup_temp_file(path: Path) -> None:
     try:
         path.unlink(missing_ok=True)
     except OSError:
         pass
+
+
+def _record_until_space() -> Path:
+    stop_event = threading.Event()
+    result: dict[str, Path] = {}
+    error: dict[str, BaseException] = {}
+
+    def target() -> None:
+        try:
+            result["audio_path"] = record_microphone_until_stopped(stop_event)
+        except BaseException as exc:
+            error["exception"] = exc
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+
+    try:
+        _wait_for_space()
+    finally:
+        stop_event.set()
+        worker.join()
+
+    if "exception" in error:
+        raise error["exception"]
+
+    return result["audio_path"]
+
+
+def _read_voice_action() -> str:
+    prompt = "Press Space to record, or type /end or /quit then Enter: "
+
+    if os.name == "nt":
+        return _read_voice_action_windows(prompt)
+
+    if sys.stdin.isatty():
+        return _read_voice_action_posix(prompt)
+
+    command = input(prompt).strip()
+    if command == "/quit":
+        return "quit"
+    if command == "/end":
+        return "end"
+    return "record"
+
+
+def _wait_for_space() -> None:
+    if os.name == "nt":
+        _wait_for_space_windows()
+        return
+
+    if sys.stdin.isatty():
+        _wait_for_space_posix()
+        return
+
+    input("Press Enter to stop recording: ")
+
+
+def _read_voice_action_windows(prompt: str) -> str:
+    import msvcrt
+
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    buffer: list[str] = []
+
+    while True:
+        char = msvcrt.getwch()
+        if char == "\x03":
+            raise KeyboardInterrupt
+        if char == " " and not buffer:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            return "record"
+        if char in ("\r", "\n"):
+            command = "".join(buffer).strip()
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            if command == "/quit":
+                return "quit"
+            if command == "/end":
+                return "end"
+            buffer.clear()
+            sys.stdout.write(prompt)
+            sys.stdout.flush()
+            continue
+        if char == "\x08":
+            if buffer:
+                buffer.pop()
+                sys.stdout.write("\b \b")
+                sys.stdout.flush()
+            continue
+        if char.isprintable():
+            buffer.append(char)
+            sys.stdout.write(char)
+            sys.stdout.flush()
+
+
+def _wait_for_space_windows() -> None:
+    import msvcrt
+
+    while True:
+        char = msvcrt.getwch()
+        if char == "\x03":
+            raise KeyboardInterrupt
+        if char == " ":
+            return
+
+
+def _read_voice_action_posix(prompt: str) -> str:
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    original = termios.tcgetattr(fd)
+    buffer: list[str] = []
+
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+
+    try:
+        tty.setraw(fd)
+        while True:
+            char = sys.stdin.read(1)
+            if char == "\x03":
+                raise KeyboardInterrupt
+            if char == " " and not buffer:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return "record"
+            if char in ("\r", "\n"):
+                command = "".join(buffer).strip()
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                if command == "/quit":
+                    return "quit"
+                if command == "/end":
+                    return "end"
+                buffer.clear()
+                sys.stdout.write(prompt)
+                sys.stdout.flush()
+                continue
+            if char in ("\x7f", "\b"):
+                if buffer:
+                    buffer.pop()
+                    sys.stdout.write("\b \b")
+                    sys.stdout.flush()
+                continue
+            if char.isprintable():
+                buffer.append(char)
+                sys.stdout.write(char)
+                sys.stdout.flush()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, original)
+
+
+def _wait_for_space_posix() -> None:
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    original = termios.tcgetattr(fd)
+
+    try:
+        tty.setraw(fd)
+        while True:
+            char = sys.stdin.read(1)
+            if char == "\x03":
+                raise KeyboardInterrupt
+            if char == " ":
+                return
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, original)
