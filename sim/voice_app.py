@@ -13,7 +13,13 @@ from sim.evaluator import evaluate_transcript
 from sim.ollama_client import OllamaClient, OllamaError
 from sim.scenarios import load_scenario
 from sim.session import SimulationSession
-from sim.speech_to_text import DEFAULT_STT_MODEL, SpeechToTextDependencyError, SpeechToTextError, transcribe_audio
+from sim.speech_to_text import (
+    DEFAULT_STT_MODEL,
+    SpeechToTextDependencyError,
+    SpeechToTextError,
+    preload_speech_to_text_model,
+    transcribe_audio,
+)
 from sim.storage import save_result
 from sim.terminal_ui import choose_scenario, print_feedback, print_scenarios
 from sim.text_to_speech import speak_text
@@ -47,6 +53,7 @@ def main() -> None:
 
     client = OllamaClient(model=args.model, host=args.host)
     session = SimulationSession(scenario, client)
+    stt_preload = _start_stt_preload(args.stt_model)
 
     print(f"\nScenario: {scenario.title}")
     print(f"Setting: {scenario.setting}")
@@ -85,6 +92,7 @@ def main() -> None:
                 continue
 
             try:
+                _await_stt_preload(stt_preload)
                 transcript = _time_step(
                     "transcription",
                     turn_latencies,
@@ -150,6 +158,31 @@ def _print_latency_summary(latencies: dict[str, float]) -> None:
 
 def _serialize_latencies(latencies: dict[str, float]) -> dict[str, float]:
     return {name: round(value, 3) for name, value in latencies.items()}
+
+
+def _start_stt_preload(model_name: str) -> dict[str, Any]:
+    preload_state: dict[str, Any] = {"error": None}
+
+    def target() -> None:
+        try:
+            preload_speech_to_text_model(model_name=model_name)
+        except BaseException as exc:
+            preload_state["error"] = exc
+
+    preload_state["thread"] = threading.Thread(target=target, daemon=True)
+    preload_state["thread"].start()
+    return preload_state
+
+
+def _await_stt_preload(preload_state: dict[str, Any]) -> None:
+    thread = preload_state.get("thread")
+    if thread is not None:
+        thread.join()
+        preload_state["thread"] = None
+
+    error = preload_state.get("error")
+    if error is not None:
+        raise error
 
 
 def _cleanup_temp_file(path: Path) -> None:

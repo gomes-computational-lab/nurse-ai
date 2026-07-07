@@ -15,6 +15,10 @@ class SpeechToTextDependencyError(SpeechToTextError):
     pass
 
 
+def preload_speech_to_text_model(*, model_name: str = DEFAULT_STT_MODEL) -> None:
+    _load_model(model_name)
+
+
 def transcribe_audio(audio_path: Path, *, model_name: str = DEFAULT_STT_MODEL) -> str:
     model = _load_model(model_name)
 
