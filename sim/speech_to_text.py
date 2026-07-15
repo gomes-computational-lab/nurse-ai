@@ -3,6 +3,8 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
+import numpy as np
+
 
 DEFAULT_STT_MODEL = "tiny.en"
 
@@ -19,18 +21,22 @@ def preload_speech_to_text_model(*, model_name: str = DEFAULT_STT_MODEL) -> None
     _load_model(model_name)
 
 
-def transcribe_audio(audio_path: Path, *, model_name: str = DEFAULT_STT_MODEL) -> str:
+def transcribe_audio(audio: Path | np.ndarray, *, model_name: str = DEFAULT_STT_MODEL) -> str:
     model = _load_model(model_name)
 
     try:
         segments, _ = model.transcribe(
-            str(audio_path),
+            str(audio) if isinstance(audio, Path) else audio,
             language="en",
             beam_size=1,
             best_of=1,
             temperature=0.0,
             condition_on_previous_text=False,
-            vad_filter=False,
+            vad_filter=True,
+            vad_parameters={
+                "min_silence_duration_ms": 300,
+                "speech_pad_ms": 200,
+            },
         )
     except Exception as exc:
         raise SpeechToTextError(f"Transcription failed: {exc}") from exc

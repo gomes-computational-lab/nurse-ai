@@ -73,16 +73,31 @@ python3 voice_demo.py --model llama3.1 --stt-model tiny.en
 
 Voice demo behavior:
 
-- press `Space` to start recording
-- press `Space` again to stop recording and transcribe
+- press `Enter` to start speaking; recording stops after 700 ms of trailing silence
+- press `Enter` while patient audio is playing to interrupt it and start the next turn
 - type `/end` and press Enter to evaluate and save the transcript
 - type `/quit` and press Enter to exit without evaluation
 
-On macOS, patient responses are spoken with the built-in `say` command. On other systems, the demo continues with printed output only and shows a one-time TTS warning.
+Use manual recording controls when automatic end-of-speech detection is not a good fit:
 
-This is an early prototype. Recording is fully local and non-streaming.
+```bash
+python3 voice_demo.py --manual-stop
+```
 
-Transcripts and feedback are saved in `transcripts/`.
+Automatic recording can be tuned with `--end-silence-ms` and `--max-recording-seconds`. It uses 30 ms WebRTC VAD frames, keeps 300 ms of audio before detected speech, waits up to 10 seconds for speech, and limits a turn to 60 seconds by default. If WebRTC VAD cannot initialize, the demo prints a warning and falls back to manual stop.
+
+Patient responses now use a cross-platform TTS path powered by `edge-tts` with local playback through `pygame`. Spoken output requires internet access for synthesis. If the TTS dependencies are missing or speech playback fails, the demo continues with printed output only and shows a one-time warning.
+
+Complete sentences are sent to TTS as soon as Ollama produces them. Synthesis of upcoming sentences overlaps current playback, and punctuation is preserved for more natural pacing. Voice responses are limited to one to three short spoken sentences so audio can start sooner.
+
+Optional TTS environment variables:
+
+- `TTS_VOICE` defaults to `en-US-AriaNeural`
+- `TTS_RATE` defaults to `+0%`
+
+Microphone capture, end-of-speech detection, transcription, and Ollama generation remain local. Edge TTS synthesis uses the network.
+
+Transcripts and feedback are saved in `transcripts/`. Voice results also include recording, endpoint, transcription, first-token, first-audio, completion, and interruption latency metrics.
 
 ## Project Layout
 
@@ -98,7 +113,7 @@ sim/
   scenarios.py          Scenario loading
   speech_to_text.py     Local transcription helpers
   terminal_ui.py        Shared terminal helpers
-  text_to_speech.py     Local TTS helpers
+  text_to_speech.py     Cross-platform TTS helpers
   voice_app.py          Voice demo flow
 scenarios/
   post_op_pain.json     Sample nursing scenario

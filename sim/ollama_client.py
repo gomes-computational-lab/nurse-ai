@@ -31,6 +31,7 @@ class OllamaClient:
         *,
         temperature: float = 0.7,
         format_json: bool = False,
+        max_tokens: int | None = None,
         on_chunk: Callable[[str], None] | None = None,
     ) -> str:
         stream = on_chunk is not None
@@ -40,6 +41,8 @@ class OllamaClient:
             "stream": stream,
             "options": {"temperature": temperature},
         }
+        if max_tokens is not None:
+            payload["options"]["num_predict"] = max_tokens
         if format_json:
             payload["format"] = "json"
 
