@@ -25,9 +25,19 @@ _synthesis_queue: queue.Queue[tuple[int, str]] = queue.Queue(maxsize=2)
 _playback_queue: queue.Queue[tuple[int, "_PreparedAudio"]] = queue.Queue(maxsize=2)
 _current_session_id = 0
 _workers_started = False
-_SENTENCE_BOUNDARY_PATTERN = re.compile(r"(.+?[.!?](?:\s+|$))", re.DOTALL)
+_SENTENCE_BOUNDARY_PATTERN = re.compile(r"[.!?](?:[\"'”’\)\]]*)\s+")
+_NON_TERMINAL_ABBREVIATION_PATTERN = re.compile(
+    r"(?:\b(?:mr|mrs|ms|dr|prof|sr|jr|st|vs|etc|e\.g|i\.e)|\b[A-Z])\.$",
+    re.IGNORECASE,
+)
+_CLAUSE_BOUNDARY_PATTERN = re.compile(r"[,;:](?:[\"'”’\)\]]*)\s+")
 _NATURAL_SPLIT_PATTERN = re.compile(r"[,;:]\s+|\s+")
 _SPEECH_WHITESPACE_PATTERN = re.compile(r"\s+")
+_MIN_FIRST_SEGMENT_CHARS = 28
+_FIRST_SEGMENT_TARGET_CHARS = max(
+    _MIN_FIRST_SEGMENT_CHARS,
+    int(os.environ.get("TTS_FIRST_SEGMENT_CHARS", "64")),
+)
 _MAX_SEGMENT_CHARS = 160
 _MIN_FALLBACK_SPLIT_CHARS = 80
 _speech_sessions: dict[int, dict[str, object]] = {}
@@ -43,6 +53,7 @@ class SpeechMetrics:
     first_audio_started_at: float | None
     completed_at: float | None
     segments_started: int
+    first_segment_submitted_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +97,7 @@ class SpeechStream:
         self._buffer = ""
         self._lock = threading.Lock()
         self._finished = False
+        self._segments_emitted = 0
 
     def add_chunk(self, chunk: str) -> None:
         if not self._enabled or not chunk:
@@ -137,6 +149,7 @@ class SpeechStream:
                 first_audio_started_at=None,
                 completed_at=time.perf_counter(),
                 segments_started=0,
+                first_segment_submitted_at=None,
             )
 
         with _speech_lock:
@@ -147,24 +160,37 @@ class SpeechStream:
                     first_audio_started_at=None,
                     completed_at=None,
                     segments_started=0,
+                    first_segment_submitted_at=None,
                 )
             return SpeechMetrics(
                 status=state["status"],
                 first_audio_started_at=state["first_audio_started_at"],
                 completed_at=state["completed_at"],
                 segments_started=int(state["segments_started"]),
+                first_segment_submitted_at=state["first_segment_submitted_at"],
             )
 
     def _drain_ready_segments_locked(self) -> list[str]:
         segments: list[str] = []
         while self._buffer:
-            sentence = _SENTENCE_BOUNDARY_PATTERN.match(self._buffer)
-            if sentence is not None:
-                segment = sentence.group(1).strip()
-                self._buffer = self._buffer[sentence.end() :]
+            sentence_end = _sentence_split_index(self._buffer)
+            if sentence_end is not None:
+                segment = self._buffer[:sentence_end].strip()
+                self._buffer = self._buffer[sentence_end:].lstrip()
                 if segment:
                     segments.append(segment)
+                    self._segments_emitted += 1
                 continue
+
+            if self._segments_emitted == 0:
+                first_segment_end = _first_segment_split_index(self._buffer)
+                if first_segment_end is not None:
+                    segment = self._buffer[:first_segment_end].strip()
+                    self._buffer = self._buffer[first_segment_end:].lstrip()
+                    if segment:
+                        segments.append(segment)
+                        self._segments_emitted += 1
+                    continue
 
             if len(self._buffer) < _MAX_SEGMENT_CHARS:
                 break
@@ -174,6 +200,7 @@ class SpeechStream:
             self._buffer = self._buffer[split_at:].lstrip()
             if segment:
                 segments.append(segment)
+                self._segments_emitted += 1
         return segments
 
     # Kept as a small test hook for callers that previously forced timer flushes.
@@ -232,14 +259,61 @@ class _EdgeTTSBackend:
                 return
 
     async def _synthesize_audio(self, text: str, cancel_event: threading.Event) -> bytes:
+        synthesis_task = asyncio.create_task(self._collect_audio(text))
+        cancellation_task = asyncio.create_task(self._wait_for_cancellation(cancel_event))
+        done, _ = await asyncio.wait(
+            {synthesis_task, cancellation_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if cancellation_task in done:
+            synthesis_task.cancel()
+            await asyncio.gather(synthesis_task, return_exceptions=True)
+            return b""
+
+        cancellation_task.cancel()
+        await asyncio.gather(cancellation_task, return_exceptions=True)
+        return await synthesis_task
+
+    async def _collect_audio(self, text: str) -> bytes:
         communicate = self._communicate(text, _TTS_VOICE, rate=_TTS_RATE)
         audio_chunks: list[bytes] = []
         async for chunk in communicate.stream():
-            if cancel_event.is_set():
-                return b""
             if chunk.get("type") == "audio":
                 audio_chunks.append(chunk["data"])
         return b"".join(audio_chunks)
+
+    async def _wait_for_cancellation(self, cancel_event: threading.Event) -> None:
+        while not cancel_event.is_set():
+            await asyncio.sleep(0.02)
+
+
+def _sentence_split_index(text: str) -> int | None:
+    for match in _SENTENCE_BOUNDARY_PATTERN.finditer(text):
+        punctuation_index = match.start()
+        if text[punctuation_index] == "." and _is_non_terminal_period(text, punctuation_index):
+            continue
+        return match.end()
+    return None
+
+
+def _is_non_terminal_period(text: str, punctuation_index: int) -> bool:
+    prefix = text[: punctuation_index + 1]
+    return _NON_TERMINAL_ABBREVIATION_PATTERN.search(prefix) is not None
+
+
+def _first_segment_split_index(text: str) -> int | None:
+    for match in _CLAUSE_BOUNDARY_PATTERN.finditer(text):
+        if match.end() >= _MIN_FIRST_SEGMENT_CHARS:
+            return match.end()
+
+    if len(text) < _FIRST_SEGMENT_TARGET_CHARS:
+        return None
+
+    window = text[:_FIRST_SEGMENT_TARGET_CHARS]
+    candidates = [match.end() for match in _NATURAL_SPLIT_PATTERN.finditer(window)]
+    usable = [index for index in candidates if index >= _MIN_FIRST_SEGMENT_CHARS]
+    return usable[-1] if usable else _FIRST_SEGMENT_TARGET_CHARS
 
 
 def _fallback_split_index(text: str) -> int:
@@ -372,6 +446,7 @@ def _begin_speech_session(
             "cancel_event": threading.Event(),
             "status": "pending",
             "first_audio_started_at": None,
+            "first_segment_submitted_at": None,
             "completed_at": None,
             "segments_started": 0,
             "on_playback_start": on_playback_start,
@@ -401,6 +476,8 @@ def _enqueue_speech(session_id: int, text: str) -> None:
         state = _speech_sessions.get(session_id)
         if state is None or state["cancel_event"].is_set():
             return
+        if state["first_segment_submitted_at"] is None:
+            state["first_segment_submitted_at"] = time.perf_counter()
         state["pending_segments"] = int(state["pending_segments"]) + 1
 
     while True:

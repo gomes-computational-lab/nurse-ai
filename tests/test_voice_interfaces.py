@@ -154,6 +154,7 @@ class VoiceInterfaceTests(unittest.TestCase):
                     first_audio_started_at=12.0,
                     completed_at=15.0,
                     segments_started=2,
+                    first_segment_submitted_at=11.0,
                 )
 
         metrics: dict[str, object] = {}
@@ -166,6 +167,8 @@ class VoiceInterfaceTests(unittest.TestCase):
         tracker.join(1.0)
 
         self.assertEqual(metrics["speech_end_to_first_audio_seconds"], 2.0)
+        self.assertEqual(metrics["speech_end_to_first_tts_segment_seconds"], 1.0)
+        self.assertEqual(metrics["first_tts_segment_to_first_audio_seconds"], 1.0)
         self.assertEqual(metrics["speech_end_to_audio_end_seconds"], 5.0)
         self.assertEqual(metrics["audio_status"], "completed")
 

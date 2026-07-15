@@ -18,6 +18,7 @@ from sim.audio import (
     record_microphone_until_stopped,
 )
 from sim.evaluator import evaluate_transcript
+from sim.latency import create_latency_report, refresh_latency_summary
 from sim.ollama_client import OllamaClient, OllamaError
 from sim.scenarios import load_scenario
 from sim.session import SimulationSession
@@ -93,11 +94,11 @@ def main() -> None:
         print("Press Enter to start recording and Enter again to stop.")
     else:
         print("Press Enter to speak. Recording stops automatically when you finish.")
-    print("Pressing Enter also interrupts any patient audio still playing.")
+    print("The next recording prompt appears after the patient finishes speaking.")
     print("Type /end or /quit, then press Enter.\n")
 
     pending_audio_trackers: list[threading.Thread] = []
-    saved_latency: dict[str, Any] = {"opening": {}, "turns": []}
+    saved_latency = create_latency_report()
 
     try:
         _await_ollama_preload(ollama_preload)
@@ -115,27 +116,33 @@ def main() -> None:
         _finish_streamed_response()
         opening_speech_stream.finish()
         opening_metrics: dict[str, Any] = {
-            "generation_seconds": _round_seconds(generation_finished - generation_started),
-            "llm_first_token_seconds": _duration_from_timestamp(
+            "llm_response_generation_seconds": _round_seconds(
+                generation_finished - generation_started
+            ),
+            "llm_time_to_first_text_seconds": _duration_from_timestamp(
                 opening_chunk_timing.get("first_token_at"), generation_started
             ),
-            "prompt_char_count": opening_prompt_char_count,
-            "turn_total_until_text": _round_seconds(generation_finished - opening_started),
+            "llm_prompt_characters": opening_prompt_char_count,
+            "opening_start_to_text_complete_seconds": _round_seconds(
+                generation_finished - opening_started
+            ),
         }
         pending_audio_trackers.append(
             _track_audio_completion(
                 opening_speech_stream,
                 opening_metrics,
                 origin=opening_started,
-                metric_prefix="opening",
+                metric_prefix="opening_start",
             )
         )
         saved_latency["opening"] = opening_metrics
+        opening_speech_stream.wait_until_done()
 
         while True:
             action = _read_voice_action()
             if action == "quit":
                 _finalize_audio_metrics(pending_audio_trackers)
+                refresh_latency_summary(saved_latency)
                 path = save_result(scenario, session.transcript, latency=saved_latency)
                 print(f"\nSaved transcript without feedback: {path}")
                 return
@@ -207,26 +214,30 @@ def main() -> None:
 
             first_token_at = chunk_timing.get("first_token_at")
             turn_metrics: dict[str, Any] = {
-                "recording_seconds": _round_seconds(recording_seconds),
-                "captured_audio_seconds": _round_seconds(recorded_audio.captured_seconds),
-                "speech_seconds": _round_seconds(recorded_audio.speech_seconds),
-                "endpoint_delay_seconds": _round_seconds(endpoint_delay),
+                "recording_wall_time_seconds": _round_seconds(recording_seconds),
+                "captured_audio_duration_seconds": _round_seconds(recorded_audio.captured_seconds),
+                "detected_speech_duration_seconds": _round_seconds(recorded_audio.speech_seconds),
+                "end_of_speech_detection_delay_seconds": _round_seconds(endpoint_delay),
                 "recording_stop_reason": recorded_audio.stop_reason,
-                "transcription_seconds": _round_seconds(
+                "speech_to_text_processing_seconds": _round_seconds(
                     transcription_finished - transcription_started
                 ),
-                "speech_end_to_transcript_seconds": _round_seconds(
+                "speech_end_to_transcript_ready_seconds": _round_seconds(
                     transcription_finished - speech_ended_at
                 ),
-                "llm_first_token_seconds": _duration_from_timestamp(
+                "llm_time_to_first_text_seconds": _duration_from_timestamp(
                     first_token_at, generation_started
                 ),
-                "speech_end_to_first_token_seconds": _duration_from_timestamp(
+                "speech_end_to_first_text_seconds": _duration_from_timestamp(
                     first_token_at, speech_ended_at
                 ),
-                "generation_seconds": _round_seconds(generation_finished - generation_started),
-                "prompt_char_count": prompt_char_count,
-                "turn_total_until_text": _round_seconds(generation_finished - turn_started),
+                "llm_response_generation_seconds": _round_seconds(
+                    generation_finished - generation_started
+                ),
+                "llm_prompt_characters": prompt_char_count,
+                "turn_start_to_text_complete_seconds": _round_seconds(
+                    generation_finished - turn_started
+                ),
             }
             pending_audio_trackers.append(
                 _track_audio_completion(
@@ -242,15 +253,18 @@ def main() -> None:
                     "metrics": turn_metrics,
                 }
             )
+            speech_stream.wait_until_done()
 
         print("\nEvaluating student performance...\n")
         _finalize_audio_metrics(pending_audio_trackers)
+        refresh_latency_summary(saved_latency)
         feedback = evaluate_transcript(scenario, session.transcript, client)
         path = save_result(scenario, session.transcript, feedback, latency=saved_latency)
         print_feedback(feedback)
         print(f"\nSaved transcript and feedback: {path}")
     except KeyboardInterrupt:
         _finalize_audio_metrics(pending_audio_trackers)
+        refresh_latency_summary(saved_latency)
         path = save_result(scenario, session.transcript, latency=saved_latency)
         print(f"\nInterrupted. Saved transcript without feedback: {path}")
     except OllamaError as exc:
@@ -300,10 +314,24 @@ def _track_audio_completion(
         speech_metrics = speech_stream.metrics()
         metrics["audio_status"] = speech_metrics.status
         metrics["audio_segments_started"] = speech_metrics.segments_started
+        metrics[f"{metric_prefix}_to_first_tts_segment_seconds"] = _duration_from_timestamp(
+            speech_metrics.first_segment_submitted_at,
+            origin,
+        )
         metrics[f"{metric_prefix}_to_first_audio_seconds"] = _duration_from_timestamp(
             speech_metrics.first_audio_started_at,
             origin,
         )
+        if (
+            speech_metrics.first_segment_submitted_at is not None
+            and speech_metrics.first_audio_started_at is not None
+        ):
+            metrics["first_tts_segment_to_first_audio_seconds"] = _round_seconds(
+                speech_metrics.first_audio_started_at
+                - speech_metrics.first_segment_submitted_at
+            )
+        else:
+            metrics["first_tts_segment_to_first_audio_seconds"] = None
         metrics[f"{metric_prefix}_to_audio_end_seconds"] = _duration_from_timestamp(
             speech_metrics.completed_at,
             origin,

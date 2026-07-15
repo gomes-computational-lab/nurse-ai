@@ -88,16 +88,45 @@ Automatic recording can be tuned with `--end-silence-ms` and `--max-recording-se
 
 Patient responses now use a cross-platform TTS path powered by `edge-tts` with local playback through `pygame`. Spoken output requires internet access for synthesis. If the TTS dependencies are missing or speech playback fails, the demo continues with printed output only and shows a one-time warning.
 
-Complete sentences are sent to TTS as soon as Ollama produces them. Synthesis of upcoming sentences overlaps current playback, and punctuation is preserved for more natural pacing. Voice responses are limited to one to three short spoken sentences so audio can start sooner.
+Generated text is sent to TTS incrementally while Ollama is still responding. Synthesis of upcoming segments overlaps current playback, and punctuation is preserved for more natural pacing. Voice responses are limited to one to three short spoken sentences so audio can start sooner.
+
+To reduce the delay before speech, the first TTS segment starts at a natural clause or at roughly 64 generated characters. Later segments remain longer for smoother prosody, and their synthesis overlaps current playback.
 
 Optional TTS environment variables:
 
 - `TTS_VOICE` defaults to `en-US-AriaNeural`
 - `TTS_RATE` defaults to `+0%`
+- `TTS_FIRST_SEGMENT_CHARS` defaults to `64`; lower values start synthesis sooner but can sound less smooth
 
 Microphone capture, end-of-speech detection, transcription, and Ollama generation remain local. Edge TTS synthesis uses the network.
 
-Transcripts and feedback are saved in `transcripts/`. Voice results also include recording, endpoint, transcription, first-token, first-audio, completion, and interruption latency metrics.
+Transcripts and feedback are saved in `transcripts/`. Voice results also include recording, endpoint, transcription, first-text, first-audio, completion, and interruption latency metrics.
+
+### Understanding Voice Metrics
+
+Every new transcript includes three aids under `latency`:
+
+- `metric_definitions` gives the unit and plain-language meaning of every recorded metric
+- `summary` reports medians across student turns and counts completed, interrupted, and failed audio responses
+- `schema_version` identifies the metric format; the clearer metric names below are version 2
+
+The most useful metrics are:
+
+| Metric | Meaning |
+| --- | --- |
+| `speech_end_to_first_audio_seconds` | Main conversational latency: from the student's last detected speech until patient audio starts. Lower is better. |
+| `speech_end_to_first_tts_segment_seconds` | Time until enough generated text is ready to begin the first TTS request. |
+| `first_tts_segment_to_first_audio_seconds` | Edge TTS network synthesis and decoding delay after that first segment is submitted. |
+| `speech_end_to_first_text_seconds` | From the student's last detected speech until the first patient text arrives. |
+| `speech_end_to_transcript_ready_seconds` | Endpoint detection and speech-to-text time combined. |
+| `speech_to_text_processing_seconds` | Time faster-whisper spends transcribing the retained audio. |
+| `llm_time_to_first_text_seconds` | Time from sending the Ollama request until its first text chunk. |
+| `llm_response_generation_seconds` | Time for Ollama to finish the complete response. |
+| `end_of_speech_detection_delay_seconds` | Silence wait before automatic recording stop, normally close to 0.7 seconds. |
+| `turn_start_to_text_complete_seconds` | Full turn time from starting recording until all patient text is ready. |
+| `audio_status` | `completed`, `interrupted`, or `failed`. |
+
+`captured_audio_duration_seconds` includes pre-roll and trailing silence, while `detected_speech_duration_seconds` counts only frames classified as speech. `llm_prompt_characters` is a prompt-size measurement, not a duration.
 
 ## Project Layout
 

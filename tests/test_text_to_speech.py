@@ -107,6 +107,8 @@ class TextToSpeechTests(unittest.TestCase):
             stream.add_chunk("Hello")
             self.assertEqual(captured, [])
             stream.add_chunk(" there.")
+            self.assertEqual(captured, [])
+            stream.add_chunk(" ")
             self.assertEqual(captured, [(7, "Hello there.")])
             stream.add_chunk(" How are you? Fine")
             stream.finish()
@@ -133,6 +135,53 @@ class TextToSpeechTests(unittest.TestCase):
         self.assertTrue(all(len(segment) <= self.tts._MAX_SEGMENT_CHARS for segment in captured))
         self.assertEqual(" ".join(captured).split(), text.split())
 
+    def test_stream_boundaries_do_not_split_decimals_or_abbreviations(self) -> None:
+        captured: list[str] = []
+
+        with patch.object(
+            self.tts,
+            "_enqueue_speech",
+            side_effect=lambda session_id, segment: captured.append(segment),
+        ):
+            stream = self.tts.SpeechStream(4, enabled=True)
+            stream.add_chunk("The dose is 2.")
+            stream.add_chunk("5 mg. Dr. ")
+            self.assertEqual(captured, ["The dose is 2.5 mg."])
+            stream.add_chunk("Smith agrees. ")
+            stream.finish()
+
+        self.assertEqual(captured, ["The dose is 2.5 mg.", "Dr. Smith agrees."])
+
+    def test_first_natural_clause_is_emitted_before_sentence_finishes(self) -> None:
+        captured: list[str] = []
+
+        with patch.object(
+            self.tts,
+            "_enqueue_speech",
+            side_effect=lambda session_id, segment: captured.append(segment),
+        ):
+            stream = self.tts.SpeechStream(5, enabled=True)
+            stream.add_chunk("It feels like an 8 out of 10, ")
+
+        self.assertEqual(captured, ["It feels like an 8 out of 10,"])
+
+    def test_first_unpunctuated_segment_is_emitted_at_early_target(self) -> None:
+        captured: list[str] = []
+        text = "I have been feeling a steady pressure across my abdomen and it keeps getting worse"
+
+        with patch.object(
+            self.tts,
+            "_enqueue_speech",
+            side_effect=lambda session_id, segment: captured.append(segment),
+        ):
+            stream = self.tts.SpeechStream(6, enabled=True)
+            stream.add_chunk(text)
+
+        self.assertEqual(len(captured), 1)
+        self.assertGreaterEqual(len(captured[0]), self.tts._MIN_FIRST_SEGMENT_CHARS)
+        self.assertLessEqual(len(captured[0]), self.tts._FIRST_SEGMENT_TARGET_CHARS)
+        self.assertTrue(text.startswith(captured[0]))
+
     def test_normalization_preserves_prosody_punctuation(self) -> None:
         text = "Wait, please; I... need help: now."
         self.assertEqual(self.tts._normalize_speech_text(text), text)
@@ -149,7 +198,7 @@ class TextToSpeechTests(unittest.TestCase):
         self.tts._backend = backend
 
         stream = self.tts.create_speech_stream()
-        stream.add_chunk("Patient says hello.")
+        stream.add_chunk("Patient says hello. ")
 
         self.assertTrue(backend.started.wait(1.0))
         self.assertEqual(backend.synthesized, ["Patient says hello."])
@@ -159,6 +208,22 @@ class TextToSpeechTests(unittest.TestCase):
         self.tts.stop_speaking()
         self.assertTrue(stream.wait_until_done(1.0))
         self.assertEqual(stream.metrics().status, "interrupted")
+
+    def test_first_clause_starts_playback_while_generation_continues(self) -> None:
+        backend = FakeBackend(self.tts._PreparedAudio, auto_finish=False)
+        self.tts._backend = backend
+
+        stream = self.tts.create_speech_stream()
+        stream.add_chunk("It feels like an 8 out of 10, ")
+
+        self.assertTrue(backend.started.wait(1.0))
+        self.assertEqual(backend.synthesized, ["It feels like an 8 out of 10,"])
+        self.assertFalse(stream._finished)
+
+        stream.add_chunk("especially when I take a deep breath.")
+        stream.finish()
+        self.tts.stop_speaking()
+        self.assertTrue(stream.wait_until_done(1.0))
 
     def test_synthesis_prefetches_and_prequeues_next_segment(self) -> None:
         backend = FakeBackend(self.tts._PreparedAudio)
@@ -216,6 +281,59 @@ class TextToSpeechTests(unittest.TestCase):
         self.assertTrue(stream.wait_until_done(1.0))
         self.assertEqual(stream.metrics().status, "failed")
         self.assertTrue(all(not path.exists() for path in backend.paths))
+
+    def test_edge_synthesis_cancels_while_stream_is_stalled(self) -> None:
+        stream_started = threading.Event()
+        stream_cancelled = threading.Event()
+
+        class Communicate:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def stream(self):
+                import asyncio
+
+                stream_started.set()
+                try:
+                    await asyncio.sleep(10)
+                finally:
+                    stream_cancelled.set()
+                if False:
+                    yield {}
+
+        class Mixer:
+            @staticmethod
+            def get_init():
+                return True
+
+            @staticmethod
+            def find_channel(force=False):
+                del force
+                return object()
+
+        edge_module = type("EdgeModule", (), {"Communicate": Communicate})
+        pygame_module = type("PygameModule", (), {"mixer": Mixer()})
+        backend = self.tts._EdgeTTSBackend(edge_module, pygame_module)
+        cancel_event = threading.Event()
+        result: list[object] = []
+        errors: list[BaseException] = []
+
+        def synthesize() -> None:
+            try:
+                result.append(backend.synthesize("Hello.", cancel_event))
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=synthesize)
+        worker.start()
+        self.assertTrue(stream_started.wait(1.0))
+        cancel_event.set()
+        worker.join(1.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result, [None])
+        self.assertTrue(stream_cancelled.is_set())
 
 
 if __name__ == "__main__":
