@@ -54,6 +54,81 @@ def scenario() -> Scenario:
 
 
 class VoiceInterfaceTests(unittest.TestCase):
+    def test_voice_loop_accepts_input_without_waiting_for_audio_completion(self) -> None:
+        from sim.voice_app import main as voice_main
+
+        class FakeStream:
+            def __init__(self):
+                self.finished = False
+                self.wait_calls = 0
+
+            def add_chunk(self, chunk):
+                del chunk
+
+            def finish(self):
+                self.finished = True
+
+            def wait_until_done(self):
+                self.wait_calls += 1
+                raise AssertionError("The command prompt must not wait for audio playback.")
+
+        class FakeSession:
+            def __init__(self):
+                self.transcript = []
+
+            def opening_prompt_char_count(self, **kwargs):
+                del kwargs
+                return 10
+
+            def opening(self, on_chunk, **kwargs):
+                del kwargs
+                on_chunk("Opening response.")
+                return "Opening response."
+
+            def response_prompt_char_count(self, *args, **kwargs):
+                del args, kwargs
+                return 20
+
+            def respond(self, student_response, on_chunk, **kwargs):
+                del student_response, kwargs
+                on_chunk("Patient response.")
+                return "Patient response."
+
+        streams = [FakeStream(), FakeStream()]
+        recorded_audio = RecordedAudio(
+            samples=np.ones(160, dtype=np.float32),
+            sample_rate=16000,
+            captured_seconds=0.01,
+            speech_seconds=0.01,
+            endpoint_delay_seconds=0.0,
+            stop_reason="silence",
+        )
+
+        with (
+            patch("sys.argv", ["voice_demo.py", "--scenario", "test"]),
+            patch("sim.voice_app.load_scenario", return_value=scenario()),
+            patch("sim.voice_app.OllamaClient", return_value=object()),
+            patch("sim.voice_app.SimulationSession", return_value=FakeSession()),
+            patch("sim.voice_app._start_stt_preload", return_value={}),
+            patch("sim.voice_app._start_ollama_preload", return_value={}),
+            patch("sim.voice_app._await_stt_preload"),
+            patch("sim.voice_app._await_ollama_preload"),
+            patch("sim.voice_app.create_speech_stream", side_effect=streams),
+            patch("sim.voice_app._track_audio_completion", return_value=object()),
+            patch("sim.voice_app._read_voice_action", side_effect=["speak", "quit"]),
+            patch("sim.voice_app._record_voice_turn", return_value=(recorded_audio, False)),
+            patch("sim.voice_app.transcribe_audio", return_value="Hello"),
+            patch("sim.voice_app.stop_speaking") as stop_speaking,
+            patch("sim.voice_app._finalize_audio_metrics"),
+            patch("sim.voice_app.refresh_latency_summary"),
+            patch("sim.voice_app.save_result", return_value="transcript.json"),
+        ):
+            voice_main()
+
+        self.assertTrue(all(stream.finished for stream in streams))
+        self.assertTrue(all(stream.wait_calls == 0 for stream in streams))
+        stop_speaking.assert_called_once_with()
+
     def test_transcription_accepts_samples_and_enables_residual_vad(self) -> None:
         model = FakeWhisperModel()
         samples = np.zeros(1600, dtype=np.float32)
