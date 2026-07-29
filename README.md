@@ -73,8 +73,9 @@ python3 voice_demo.py --model llama3.1 --stt-model tiny.en
 
 Voice demo behavior:
 
-- press `Enter` to start speaking; recording stops after 700 ms of trailing silence
-- press `Enter` while patient audio is playing to interrupt it and start the next turn
+- wait for the patient audio to finish, then press `Enter` to start speaking
+- recording and speech-to-text do not start until `Enter` is pressed
+- recording stops after 700 ms of trailing silence
 - type `/end` and press Enter to evaluate and save the transcript
 - type `/quit` and press Enter to exit without evaluation
 

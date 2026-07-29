@@ -54,7 +54,7 @@ def scenario() -> Scenario:
 
 
 class VoiceInterfaceTests(unittest.TestCase):
-    def test_voice_loop_accepts_input_without_waiting_for_audio_completion(self) -> None:
+    def test_voice_loop_waits_for_patient_audio_before_accepting_student_input(self) -> None:
         from sim.voice_app import main as voice_main
 
         class FakeStream:
@@ -70,7 +70,7 @@ class VoiceInterfaceTests(unittest.TestCase):
 
             def wait_until_done(self):
                 self.wait_calls += 1
-                raise AssertionError("The command prompt must not wait for audio playback.")
+                return True
 
         class FakeSession:
             def __init__(self):
@@ -126,7 +126,7 @@ class VoiceInterfaceTests(unittest.TestCase):
             voice_main()
 
         self.assertTrue(all(stream.finished for stream in streams))
-        self.assertTrue(all(stream.wait_calls == 0 for stream in streams))
+        self.assertTrue(all(stream.wait_calls == 1 for stream in streams))
         stop_speaking.assert_called_once_with()
 
     def test_transcription_accepts_samples_and_enables_residual_vad(self) -> None:

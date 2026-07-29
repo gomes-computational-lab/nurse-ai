@@ -94,7 +94,7 @@ def main() -> None:
         print("Press Enter to start recording and Enter again to stop.")
     else:
         print("Press Enter to speak. Recording stops automatically when you finish.")
-    print("Press Enter during patient audio to interrupt it and start your next turn.")
+    print("The next recording prompt appears after the patient finishes speaking.")
     print("Type /end or /quit, then press Enter.\n")
 
     pending_audio_trackers: list[threading.Thread] = []
@@ -136,6 +136,7 @@ def main() -> None:
             )
         )
         saved_latency["opening"] = opening_metrics
+        opening_speech_stream.wait_until_done()
 
         while True:
             action = _read_voice_action()
@@ -252,6 +253,7 @@ def main() -> None:
                     "metrics": turn_metrics,
                 }
             )
+            speech_stream.wait_until_done()
 
         print("\nEvaluating student performance...\n")
         _finalize_audio_metrics(pending_audio_trackers)
