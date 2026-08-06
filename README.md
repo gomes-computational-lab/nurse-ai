@@ -2,10 +2,10 @@
 
 A local terminal prototype for conversational nursing simulations using Ollama.
 
-The project now includes two terminal paths:
+The project uses `main.py` for both terminal paths:
 
-- `main.py` for the original typed conversation flow
-- `voice_demo.py` for a local voice loop using microphone input, faster-whisper transcription, Ollama, and spoken patient responses
+- `python3 main.py` starts the original typed conversation flow
+- `python3 main.py --voice` starts the local voice flow using microphone input, faster-whisper transcription, Ollama, and spoken patient responses
 
 ## Requirements
 
@@ -56,19 +56,19 @@ python3 main.py --scenario post_op_pain
 ## Run The Voice Demo
 
 ```bash
-python3 voice_demo.py
+python3 main.py --voice
 ```
 
 Run a specific scenario:
 
 ```bash
-python3 voice_demo.py --scenario post_op_pain
+python3 main.py --voice --scenario post_op_pain
 ```
 
 Change the Ollama model or faster-whisper model:
 
 ```bash
-python3 voice_demo.py --model llama3.1 --stt-model tiny.en
+python3 main.py --voice --model llama3.1 --stt-model tiny.en
 ```
 
 Voice demo behavior:
@@ -82,7 +82,7 @@ Voice demo behavior:
 Use manual recording controls when automatic end-of-speech detection is not a good fit:
 
 ```bash
-python3 voice_demo.py --manual-stop
+python3 main.py --voice --manual-stop
 ```
 
 Automatic recording can be tuned with `--end-silence-ms` and `--max-recording-seconds`. It uses 30 ms WebRTC VAD frames, keeps 300 ms of audio before detected speech, waits up to 10 seconds for speech, and limits a turn to 60 seconds by default. If WebRTC VAD cannot initialize, the demo prints a warning and falls back to manual stop.
@@ -132,8 +132,8 @@ The most useful metrics are:
 ## Project Layout
 
 ```text
-main.py                 Typed terminal entry point
-voice_demo.py           Voice demo entry point
+main.py                 Typed and --voice terminal entry point
+voice_demo.py           Backward-compatible voice launcher
 sim/
   app.py                Typed terminal app flow
   audio.py              Microphone recording helpers
