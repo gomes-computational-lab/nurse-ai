@@ -3,15 +3,16 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from typing import Any
 
 from sim.evaluator import evaluate_transcript
 from sim.ollama_client import OllamaClient, OllamaError
-from sim.scenarios import list_scenarios, load_scenario
+from sim.scenarios import load_scenario
 from sim.session import SimulationSession
 from sim.storage import save_result
+from sim.terminal_ui import choose_scenario, print_feedback, print_scenarios
 
-DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:1.7b")
+
+DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
 
 
 def main() -> None:
@@ -23,11 +24,11 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.list:
-        _print_scenarios()
+        print_scenarios()
         return
 
     try:
-        scenario = load_scenario(args.scenario) if args.scenario else _choose_scenario()
+        scenario = load_scenario(args.scenario) if args.scenario else choose_scenario()
     except (FileNotFoundError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1)
@@ -40,8 +41,9 @@ def main() -> None:
     print("Type /help for commands.\n")
 
     try:
-        patient_text = session.opening()
-        print(f"{scenario.role}: {patient_text}\n")
+        _print_role_prefix(scenario.role)
+        patient_text = session.opening(on_chunk=_print_stream_chunk)
+        _finish_streamed_response()
 
         while True:
             student_text = input("Student: ").strip()
@@ -57,13 +59,14 @@ def main() -> None:
             if student_text == "/end":
                 break
 
-            patient_text = session.respond(student_text)
-            print(f"\n{scenario.role}: {patient_text}\n")
+            _print_role_prefix(scenario.role)
+            patient_text = session.respond(student_text, on_chunk=_print_stream_chunk)
+            _finish_streamed_response()
 
         print("\nEvaluating student performance...\n")
         feedback = evaluate_transcript(scenario, session.transcript, client)
         path = save_result(scenario, session.transcript, feedback)
-        _print_feedback(feedback)
+        print_feedback(feedback)
         print(f"\nSaved transcript and feedback: {path}")
     except KeyboardInterrupt:
         path = save_result(scenario, session.transcript)
@@ -73,27 +76,6 @@ def main() -> None:
         raise SystemExit(1)
 
 
-def _choose_scenario():
-    scenarios = list_scenarios()
-    if not scenarios:
-        raise ValueError("No scenarios found in scenarios/.")
-
-    print("Available scenarios:")
-    for index, scenario in enumerate(scenarios, start=1):
-        print(f"{index}. {scenario.id} - {scenario.title}")
-
-    while True:
-        choice = input("\nChoose scenario number: ").strip()
-        if choice.isdigit() and 1 <= int(choice) <= len(scenarios):
-            return scenarios[int(choice) - 1]
-        print("Please enter a valid scenario number.")
-
-
-def _print_scenarios() -> None:
-    for scenario in list_scenarios():
-        print(f"{scenario.id}: {scenario.title}")
-
-
 def _print_help() -> None:
     print("\nCommands:")
     print("  /end   End simulation and generate feedback")
@@ -101,33 +83,13 @@ def _print_help() -> None:
     print("  /help  Show this help\n")
 
 
-def _print_feedback(feedback: dict[str, Any]) -> None:
-    print("Feedback")
-    print("--------")
-    print(f"Overall score: {feedback.get('overall_score')}")
-    print(f"Summary: {feedback.get('summary')}\n")
-
-    criteria = feedback.get("criteria", {})
-    if isinstance(criteria, dict) and criteria:
-        print("Criteria:")
-        for name, result in criteria.items():
-            if isinstance(result, dict):
-                print(f"- {name}: {result.get('score')}/5")
-                print(f"  Evidence: {result.get('evidence')}")
-                print(f"  Coaching: {result.get('coaching')}")
-
-    _print_list("Strengths", feedback.get("strengths"))
-    _print_list("Improvements", feedback.get("improvements"))
-    _print_list("Safety concerns", feedback.get("safety_concerns"))
+def _print_role_prefix(role: str) -> None:
+    print(f"{role}: ", end="", flush=True)
 
 
-def _print_list(title: str, values: Any) -> None:
-    if not values:
-        return
-    print(f"\n{title}:")
-    if isinstance(values, list):
-        for value in values:
-            print(f"- {value}")
-    else:
-        print(values)
+def _print_stream_chunk(chunk: str) -> None:
+    print(chunk, end="", flush=True)
 
+
+def _finish_streamed_response() -> None:
+    print("\n")

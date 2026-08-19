@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+from typing import Callable, Literal
+
 from sim.models import Message, Scenario
 from sim.ollama_client import OllamaClient
+
+
+ResponseMode = Literal["text", "voice"]
+VOICE_MAX_TOKENS = 80
 
 
 class SimulationSession:
@@ -10,19 +16,72 @@ class SimulationSession:
         self.client = client
         self.transcript: list[Message] = []
 
-    def opening(self) -> str:
-        response = self.client.chat(self._patient_messages(), temperature=0.75)
+    def opening(
+        self,
+        on_chunk: Callable[[str], None] | None = None,
+        *,
+        response_mode: ResponseMode = "text",
+    ) -> str:
+        response = self.client.chat(
+            self._patient_messages(response_mode=response_mode),
+            temperature=0.75,
+            max_tokens=VOICE_MAX_TOKENS if response_mode == "voice" else None,
+            on_chunk=on_chunk,
+        )
         self.transcript.append(Message(role="patient", content=response))
         return response
 
-    def respond(self, student_response: str) -> str:
+    def respond(
+        self,
+        student_response: str,
+        on_chunk: Callable[[str], None] | None = None,
+        *,
+        response_mode: ResponseMode = "text",
+    ) -> str:
+        messages = self._patient_messages(
+            student_response=student_response,
+            response_mode=response_mode,
+        )
         self.transcript.append(Message(role="student", content=student_response))
-        response = self.client.chat(self._patient_messages(), temperature=0.75)
+        response = self.client.chat(
+            messages,
+            temperature=0.75,
+            max_tokens=VOICE_MAX_TOKENS if response_mode == "voice" else None,
+            on_chunk=on_chunk,
+        )
         self.transcript.append(Message(role="patient", content=response))
         return response
 
-    def _patient_messages(self) -> list[dict[str, str]]:
-        messages = [{"role": "system", "content": self._system_prompt()}]
+    def opening_prompt_char_count(self, *, response_mode: ResponseMode = "text") -> int:
+        return self._prompt_char_count(self._patient_messages(response_mode=response_mode))
+
+    def response_prompt_char_count(
+        self,
+        student_response: str,
+        *,
+        response_mode: ResponseMode = "text",
+    ) -> int:
+        return self._prompt_char_count(
+            self._patient_messages(
+                student_response=student_response,
+                response_mode=response_mode,
+            )
+        )
+
+    def _patient_messages(
+        self,
+        student_response: str | None = None,
+        *,
+        response_mode: ResponseMode = "text",
+    ) -> list[dict[str, str]]:
+        system_prompt = self._system_prompt()
+        if response_mode == "voice":
+            system_prompt += (
+                "\n\nVoice response style:\n"
+                "- Respond in one to three short, naturally punctuated spoken sentences.\n"
+                "- Do not use Markdown, lists, stage directions, or parenthetical actions."
+            )
+        messages = [{"role": "system", "content": system_prompt}]
 
         if not self.transcript:
             messages.append({"role": "user", "content": self.scenario.opening_prompt})
@@ -33,6 +92,9 @@ class SimulationSession:
                 messages.append({"role": "user", "content": message.content})
             else:
                 messages.append({"role": "assistant", "content": message.content})
+
+        if student_response is not None:
+            messages.append({"role": "user", "content": student_response})
 
         messages.append(
             {
@@ -72,3 +134,5 @@ Do not provide coaching, scoring, or meta-commentary during the conversation.
 If the student says something unsafe, react realistically with concern, confusion, fear, or resistance.
 """.strip()
 
+    def _prompt_char_count(self, messages: list[dict[str, str]]) -> int:
+        return sum(len(message["content"]) for message in messages)
