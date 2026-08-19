@@ -1,0 +1,25 @@
+Scenario: Postoperative Pain and Anxiety
+Setting: Medical-surgical unit, 6 hours after abdominal surgery
+
+Patient: Nurse, can you come here please? My stomach hurts so much, and every time I try to take a deep breath it feels worse. Is something wrong?
+
+Student: I'm sorry you're hurting. I'm here with you. Can you tell me where the pain is and how bad it feels on a scale from 0 to 10?
+
+Patient: It's mostly around my incision, kind of sharp and pulling. I would say it's an 8 out of 10. I'm scared to cough or move because it hurts.
+
+Student: Thank you for telling me. Pain after surgery can make breathing and moving harder, so we want to manage it. I’m going to check your vital signs, look at your incision, and see what pain medicine is ordered.
+
+Patient: Okay. I was worried the pain meant something went wrong. I just don't want to make it worse.
+
+Student: That makes sense. I’ll explain what I’m doing as we go. After we help your pain, we’ll work on slow deep breaths and using the incentive spirometer so your lungs stay clear.
+
+Patient: I haven't been using that breathing thing because it hurts too much.
+
+Student: That’s understandable. We can time it after your pain medication starts working, and I can support your incision with a pillow while you cough or breathe deeply.
+
+Patient: That sounds better. I didn’t know holding the pillow could help.
+
+Student: It often does. I also want you to use the call light before getting up, because pain medicine and surgery can make you weaker or dizzy. I’ll stay with you while we get this under control.
+
+Patient: Thank you. I feel a little less scared now.
+
