@@ -1,0 +1,6 @@
+faster-whisper
+sounddevice
+numpy
+webrtcvad-wheels
+edge-tts
+pygame
