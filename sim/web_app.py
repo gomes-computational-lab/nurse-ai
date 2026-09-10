@@ -54,6 +54,7 @@ def main() -> None:
 
     if session is None:
         st.info("Choose a scenario and start a simulation.")
+        _render_getting_started()
         _render_scenario_preview(config["scenario"])
         return
 
@@ -102,6 +103,18 @@ def _render_sidebar() -> dict[str, Any]:
         )
         patient_audio = st.toggle("Patient browser audio", value=True, disabled=active)
 
+        with st.expander("Setup help", icon=":material/help:"):
+            st.markdown(
+                "1. Start Ollama on this computer.\n"
+                "2. Confirm the selected Ollama model is installed.\n"
+                "3. Keep the default host unless Ollama runs elsewhere.\n"
+                "4. Allow microphone access when the browser asks."
+            )
+            st.code("ollama serve\nollama pull llama3.1", language="bash")
+            st.caption(
+                "Microphone capture works on localhost or a secure HTTPS connection."
+            )
+
         config = {
             "scenario": scenario,
             "model": model.strip(),
@@ -134,6 +147,23 @@ def _render_scenario_preview(scenario) -> None:
     with st.expander("Learning objectives"):
         for objective in scenario.learning_objectives:
             st.markdown(f"- {objective}")
+
+
+def _render_getting_started() -> None:
+    with st.container(border=True):
+        st.subheader("Set up voice practice")
+        st.markdown(
+            "1. **Start Ollama** and make sure the model selected in the sidebar is available.\n"
+            "2. **Choose a scenario** and decide whether patient audio should play.\n"
+            "3. **Select Start simulation**, then allow microphone access in your browser.\n"
+            "4. **Listen to the patient.** Recording begins automatically when the patient finishes.\n"
+            "5. **Speak your response**, then stay quiet for five seconds to stop recording.\n"
+            "6. **Review the transcription** and select **Send response**."
+        )
+        st.caption(
+            "If browser autoplay is blocked, play the patient audio manually and then select "
+            "Start recording. You can always type or edit your response."
+        )
 
 
 def _start_simulation(config: dict[str, Any]) -> bool:
@@ -182,6 +212,34 @@ def _render_composer() -> None:
     st.markdown("#### Your response")
 
     session: SimulationSession = st.session_state.simulation_session
+    patient_audio_enabled = st.session_state.simulation_config["patient_audio"]
+    if patient_audio_enabled:
+        st.info(
+            "Wait for the patient to finish speaking. Recording starts automatically; "
+            "when you finish your response, remain quiet for five seconds.",
+            icon=":material/mic:",
+        )
+    else:
+        st.info(
+            "Recording starts automatically when the patient's text response is ready; "
+            "when you finish your response, remain quiet for five seconds.",
+            icon=":material/mic:",
+        )
+
+    with st.expander(
+        "Voice controls and troubleshooting",
+        expanded=len(session.transcript) == 1,
+        icon=":material/info:",
+    ):
+        st.markdown(
+            "- Allow microphone access when prompted.\n"
+            "- A pulsing red dot means recording is active.\n"
+            "- Speak naturally; brief pauses shorter than five seconds are okay.\n"
+            "- After five seconds of silence, transcription starts automatically.\n"
+            "- Edit the transcription if needed, then select **Send response**.\n"
+            "- If autoplay is blocked, play the patient audio above and select **Start recording**."
+        )
+
     patient_message_index = len(session.transcript) - 1
     turn_id = f"{patient_message_index}:{st.session_state.recorder_version}"
     patient_audio = st.session_state.patient_audio.get(patient_message_index)

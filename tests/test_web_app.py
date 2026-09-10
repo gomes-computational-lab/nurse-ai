@@ -70,6 +70,13 @@ class StreamlitAppTests(unittest.TestCase):
         self.assertFalse(app.exception)
         self.assertEqual(app.title[0].value, "Nursing AI Simulation")
         self.assertIn("Browser Test", [item.value for item in app.subheader])
+        self.assertIn("Set up voice practice", [item.value for item in app.subheader])
+        self.assertTrue(
+            any(
+                "Start Ollama on this computer" in item.value
+                for item in app.sidebar.markdown
+            )
+        )
         self.assertIn("Start simulation", [button.label for button in app.button])
 
     def test_typed_turn_uses_session_and_renders_both_messages(self) -> None:
@@ -82,6 +89,12 @@ class StreamlitAppTests(unittest.TestCase):
             self.assertFalse(app.exception)
             self.assertEqual(len(app.get("audio_input")), 0)
             self.assertTrue(all(item.disabled for item in app.sidebar.text_input))
+            self.assertTrue(
+                any(
+                    "A pulsing red dot means recording is active" in item.value
+                    for item in app.markdown
+                )
+            )
             self.assertIn(
                 "Can you help me with this pain?",
                 [markdown.value for markdown in app.markdown],
