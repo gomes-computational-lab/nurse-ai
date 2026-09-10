@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from io import BytesIO
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 
@@ -10,7 +12,7 @@ from sim.audio import RecordedAudio, VoiceActivityDetectionUnavailable
 from sim.models import Scenario
 from sim.ollama_client import OllamaClient
 from sim.session import SimulationSession, VOICE_MAX_TOKENS
-from sim.speech_to_text import transcribe_audio
+from sim.speech_to_text import transcribe_audio, transcribe_audio_bytes
 from sim.text_to_speech import SpeechMetrics
 
 
@@ -141,6 +143,91 @@ class VoiceInterfaceTests(unittest.TestCase):
         self.assertTrue(model.options["vad_filter"])
         self.assertEqual(model.options["beam_size"], 1)
         self.assertEqual(model.options["vad_parameters"]["speech_pad_ms"], 200)
+
+    def test_browser_audio_bytes_use_a_temporary_file_and_clean_it_up(self) -> None:
+        observed_path: Path | None = None
+
+        def fake_transcribe(path, *, model_name):
+            nonlocal observed_path
+            observed_path = path
+            self.assertTrue(path.exists())
+            self.assertEqual(path.read_bytes(), b"RIFF fake wav")
+            self.assertEqual(model_name, "tiny.en")
+            return "browser transcript"
+
+        with patch("sim.speech_to_text.transcribe_audio", side_effect=fake_transcribe):
+            result = transcribe_audio_bytes(BytesIO(b"RIFF fake wav"))
+
+        self.assertEqual(result, "browser transcript")
+        self.assertIsNotNone(observed_path)
+        self.assertFalse(observed_path.exists())
+
+    def test_empty_browser_audio_does_not_load_the_stt_model(self) -> None:
+        with patch("sim.speech_to_text.transcribe_audio") as transcribe:
+            result = transcribe_audio_bytes(b"")
+
+        self.assertEqual(result, "")
+        transcribe.assert_not_called()
+
+    def test_browser_audio_temp_file_is_cleaned_after_transcription_failure(self) -> None:
+        observed_path: Path | None = None
+
+        def fail(path, *, model_name):
+            nonlocal observed_path
+            del model_name
+            observed_path = path
+            raise RuntimeError("failed")
+
+        with patch("sim.speech_to_text.transcribe_audio", side_effect=fail):
+            with self.assertRaisesRegex(RuntimeError, "failed"):
+                transcribe_audio_bytes(b"RIFF fake wav")
+
+        self.assertIsNotNone(observed_path)
+        self.assertFalse(observed_path.exists())
+
+    def test_browser_tts_returns_mp3_bytes(self) -> None:
+        import sim.text_to_speech as tts
+
+        class Communicate:
+            def __init__(self, text, voice, rate):
+                self.options = (text, voice, rate)
+
+            async def stream(self):
+                yield {"type": "metadata", "data": b"ignored"}
+                yield {"type": "audio", "data": b"first"}
+                yield {"type": "audio", "data": b"second"}
+
+        edge_tts = type("EdgeTTS", (), {"Communicate": Communicate})
+        with patch("sim.text_to_speech.importlib.import_module", return_value=edge_tts):
+            result = tts.synthesize_speech_bytes("  Patient says hello.  ")
+
+        self.assertEqual(result, b"firstsecond")
+
+    def test_browser_tts_reports_missing_dependency(self) -> None:
+        import sim.text_to_speech as tts
+
+        with patch(
+            "sim.text_to_speech.importlib.import_module",
+            side_effect=ImportError("missing"),
+        ):
+            with self.assertRaises(tts.TextToSpeechDependencyError):
+                tts.synthesize_speech_bytes("Hello")
+
+    def test_browser_tts_rejects_empty_audio_response(self) -> None:
+        import sim.text_to_speech as tts
+
+        class Communicate:
+            def __init__(self, *args, **kwargs):
+                del args, kwargs
+
+            async def stream(self):
+                if False:
+                    yield {}
+
+        edge_tts = type("EdgeTTS", (), {"Communicate": Communicate})
+        with patch("sim.text_to_speech.importlib.import_module", return_value=edge_tts):
+            with self.assertRaisesRegex(tts.TextToSpeechError, "no audio"):
+                tts.synthesize_speech_bytes("Hello")
 
     def test_voice_mode_adds_spoken_prompt_and_token_limit(self) -> None:
         client = FakeClient()

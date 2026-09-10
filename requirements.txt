@@ -4,3 +4,4 @@ numpy
 webrtcvad-wheels
 edge-tts
 pygame
+streamlit>=1.60,<2
