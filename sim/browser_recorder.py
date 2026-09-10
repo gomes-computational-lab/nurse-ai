@@ -278,7 +278,8 @@ export default function(component) {
     }
 
     setStatus("waiting", "Listening to the patient…")
-    patientAudio = new Audio(`data:audio/mpeg;base64,${data.patient_audio_base64}`)
+    const patientAudioMimeType = data.patient_audio_mime_type || "audio/mpeg"
+    patientAudio = new Audio(`data:${patientAudioMimeType};base64,${data.patient_audio_base64}`)
     patientAudio.onended = async () => {
       setStatus("waiting", "Patient finished. Starting the microphone…")
       try {
@@ -339,6 +340,7 @@ def automatic_silence_recorder(
     *,
     turn_id: str,
     patient_audio: bytes | None,
+    patient_audio_mime_type: str = "audio/mpeg",
     key: str,
     active: bool = True,
     speech_start_timeout_seconds: int = SPEECH_START_TIMEOUT_SECONDS,
@@ -354,6 +356,7 @@ def automatic_silence_recorder(
             "turn_id": turn_id,
             "active": active,
             "patient_audio_base64": encoded_patient_audio,
+            "patient_audio_mime_type": patient_audio_mime_type,
             "speech_start_timeout_seconds": speech_start_timeout_seconds,
             "trailing_silence_seconds": trailing_silence_seconds,
             "max_recording_seconds": MAX_RECORDING_SECONDS,

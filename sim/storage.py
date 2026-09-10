@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -27,7 +28,7 @@ def save_result(
             "title": scenario.title,
             "setting": scenario.setting,
         },
-        "transcript": [message.__dict__ for message in transcript],
+        "transcript": [asdict(message) for message in transcript],
         "feedback": feedback,
     }
     if latency is not None:

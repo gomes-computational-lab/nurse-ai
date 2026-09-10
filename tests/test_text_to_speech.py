@@ -33,7 +33,8 @@ class FakeBackend:
         self._polls = 0
         self._lock = threading.Lock()
 
-    def synthesize(self, text: str, cancel_event: threading.Event):
+    def synthesize(self, text: str, style, cancel_event: threading.Event):
+        del style
         if self.fail_synthesis:
             raise RuntimeError("offline")
         if cancel_event.is_set():
@@ -95,7 +96,7 @@ class TextToSpeechTests(unittest.TestCase):
 
         self.tts = importlib.reload(tts)
 
-    def test_speech_stream_emits_complete_sentences_immediately_in_order(self) -> None:
+    def test_speech_stream_submits_one_complete_utterance_after_finish(self) -> None:
         captured: list[tuple[int, str]] = []
 
         with patch.object(
@@ -109,16 +110,13 @@ class TextToSpeechTests(unittest.TestCase):
             stream.add_chunk(" there.")
             self.assertEqual(captured, [])
             stream.add_chunk(" ")
-            self.assertEqual(captured, [(7, "Hello there.")])
+            self.assertEqual(captured, [])
             stream.add_chunk(" How are you? Fine")
             stream.finish()
 
-        self.assertEqual(
-            captured,
-            [(7, "Hello there."), (7, "How are you?"), (7, "Fine")],
-        )
+        self.assertEqual(captured, [(7, "Hello there.  How are you? Fine")])
 
-    def test_long_unpunctuated_text_splits_at_a_word_boundary(self) -> None:
+    def test_long_unpunctuated_text_remains_one_utterance(self) -> None:
         captured: list[str] = []
         text = "word " * 50
 
@@ -131,11 +129,10 @@ class TextToSpeechTests(unittest.TestCase):
             stream.add_chunk(text)
             stream.finish()
 
-        self.assertGreaterEqual(len(captured), 2)
-        self.assertTrue(all(len(segment) <= self.tts._MAX_SEGMENT_CHARS for segment in captured))
-        self.assertEqual(" ".join(captured).split(), text.split())
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0].split(), text.split())
 
-    def test_stream_boundaries_do_not_split_decimals_or_abbreviations(self) -> None:
+    def test_stream_waits_for_finish_with_decimals_and_abbreviations(self) -> None:
         captured: list[str] = []
 
         with patch.object(
@@ -146,13 +143,13 @@ class TextToSpeechTests(unittest.TestCase):
             stream = self.tts.SpeechStream(4, enabled=True)
             stream.add_chunk("The dose is 2.")
             stream.add_chunk("5 mg. Dr. ")
-            self.assertEqual(captured, ["The dose is 2.5 mg."])
+            self.assertEqual(captured, [])
             stream.add_chunk("Smith agrees. ")
             stream.finish()
 
-        self.assertEqual(captured, ["The dose is 2.5 mg.", "Dr. Smith agrees."])
+        self.assertEqual(captured, ["The dose is 2.5 mg. Dr. Smith agrees."])
 
-    def test_first_natural_clause_is_emitted_before_sentence_finishes(self) -> None:
+    def test_clause_is_not_emitted_before_response_finishes(self) -> None:
         captured: list[str] = []
 
         with patch.object(
@@ -163,9 +160,9 @@ class TextToSpeechTests(unittest.TestCase):
             stream = self.tts.SpeechStream(5, enabled=True)
             stream.add_chunk("It feels like an 8 out of 10, ")
 
-        self.assertEqual(captured, ["It feels like an 8 out of 10,"])
+        self.assertEqual(captured, [])
 
-    def test_first_unpunctuated_segment_is_emitted_at_early_target(self) -> None:
+    def test_unpunctuated_text_is_not_emitted_before_finish(self) -> None:
         captured: list[str] = []
         text = "I have been feeling a steady pressure across my abdomen and it keeps getting worse"
 
@@ -177,10 +174,7 @@ class TextToSpeechTests(unittest.TestCase):
             stream = self.tts.SpeechStream(6, enabled=True)
             stream.add_chunk(text)
 
-        self.assertEqual(len(captured), 1)
-        self.assertGreaterEqual(len(captured[0]), self.tts._MIN_FIRST_SEGMENT_CHARS)
-        self.assertLessEqual(len(captured[0]), self.tts._FIRST_SEGMENT_TARGET_CHARS)
-        self.assertTrue(text.startswith(captured[0]))
+        self.assertEqual(captured, [])
 
     def test_normalization_preserves_prosody_punctuation(self) -> None:
         text = "Wait, please; I... need help: now."
@@ -193,39 +187,44 @@ class TextToSpeechTests(unittest.TestCase):
         self.assertFalse(stream._enabled)
         self.assertEqual(stream.metrics().status, "failed")
 
-    def test_streamed_sentence_starts_before_response_finishes(self) -> None:
+    def test_streamed_sentence_starts_only_after_response_finishes(self) -> None:
         backend = FakeBackend(self.tts._PreparedAudio, auto_finish=False)
         self.tts._backend = backend
 
         stream = self.tts.create_speech_stream()
         stream.add_chunk("Patient says hello. ")
 
-        self.assertTrue(backend.started.wait(1.0))
-        self.assertEqual(backend.synthesized, ["Patient says hello."])
+        self.assertFalse(backend.started.wait(0.05))
 
         stream.add_chunk(" Another response.")
         stream.finish()
+        self.assertTrue(backend.started.wait(1.0))
+        self.assertEqual(backend.synthesized, ["Patient says hello. Another response."])
         self.tts.stop_speaking()
         self.assertTrue(stream.wait_until_done(1.0))
         self.assertEqual(stream.metrics().status, "interrupted")
 
-    def test_first_clause_starts_playback_while_generation_continues(self) -> None:
+    def test_first_clause_waits_for_complete_response(self) -> None:
         backend = FakeBackend(self.tts._PreparedAudio, auto_finish=False)
         self.tts._backend = backend
 
         stream = self.tts.create_speech_stream()
         stream.add_chunk("It feels like an 8 out of 10, ")
 
-        self.assertTrue(backend.started.wait(1.0))
-        self.assertEqual(backend.synthesized, ["It feels like an 8 out of 10,"])
+        self.assertFalse(backend.started.wait(0.05))
         self.assertFalse(stream._finished)
 
         stream.add_chunk("especially when I take a deep breath.")
         stream.finish()
+        self.assertTrue(backend.started.wait(1.0))
+        self.assertEqual(
+            backend.synthesized,
+            ["It feels like an 8 out of 10, especially when I take a deep breath."],
+        )
         self.tts.stop_speaking()
         self.assertTrue(stream.wait_until_done(1.0))
 
-    def test_synthesis_prefetches_and_prequeues_next_segment(self) -> None:
+    def test_complete_response_uses_one_synthesis_request(self) -> None:
         backend = FakeBackend(self.tts._PreparedAudio)
         self.tts._backend = backend
 
@@ -233,11 +232,10 @@ class TextToSpeechTests(unittest.TestCase):
         stream.add_chunk("First sentence. Second sentence.")
         stream.finish()
 
-        self.assertTrue(backend.queued.wait(1.0))
         self.assertTrue(stream.wait_until_done(2.0))
-        self.assertEqual(backend.synthesized, ["First sentence.", "Second sentence."])
+        self.assertEqual(backend.synthesized, ["First sentence. Second sentence."])
         self.assertEqual(stream.metrics().status, "completed")
-        self.assertEqual(stream.metrics().segments_started, 2)
+        self.assertEqual(stream.metrics().segments_started, 1)
         self.assertTrue(all(not path.exists() for path in backend.paths))
 
     def test_stop_speaking_cancels_playback_and_cleans_queues(self) -> None:
@@ -281,59 +279,6 @@ class TextToSpeechTests(unittest.TestCase):
         self.assertTrue(stream.wait_until_done(1.0))
         self.assertEqual(stream.metrics().status, "failed")
         self.assertTrue(all(not path.exists() for path in backend.paths))
-
-    def test_edge_synthesis_cancels_while_stream_is_stalled(self) -> None:
-        stream_started = threading.Event()
-        stream_cancelled = threading.Event()
-
-        class Communicate:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            async def stream(self):
-                import asyncio
-
-                stream_started.set()
-                try:
-                    await asyncio.sleep(10)
-                finally:
-                    stream_cancelled.set()
-                if False:
-                    yield {}
-
-        class Mixer:
-            @staticmethod
-            def get_init():
-                return True
-
-            @staticmethod
-            def find_channel(force=False):
-                del force
-                return object()
-
-        edge_module = type("EdgeModule", (), {"Communicate": Communicate})
-        pygame_module = type("PygameModule", (), {"mixer": Mixer()})
-        backend = self.tts._EdgeTTSBackend(edge_module, pygame_module)
-        cancel_event = threading.Event()
-        result: list[object] = []
-        errors: list[BaseException] = []
-
-        def synthesize() -> None:
-            try:
-                result.append(backend.synthesize("Hello.", cancel_event))
-            except BaseException as exc:
-                errors.append(exc)
-
-        worker = threading.Thread(target=synthesize)
-        worker.start()
-        self.assertTrue(stream_started.wait(1.0))
-        cancel_event.set()
-        worker.join(1.0)
-
-        self.assertFalse(worker.is_alive())
-        self.assertEqual(errors, [])
-        self.assertEqual(result, [None])
-        self.assertTrue(stream_cancelled.is_set())
 
 
 if __name__ == "__main__":

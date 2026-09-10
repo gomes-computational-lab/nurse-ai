@@ -18,6 +18,7 @@ from sim.audio import (
     record_microphone_until_stopped,
 )
 from sim.evaluator import evaluate_transcript
+from sim.expressive_tts import DEFAULT_TTS_PROVIDER, DEFAULT_ZONOS2_URL, TTSConfig
 from sim.latency import create_latency_report, refresh_latency_summary
 from sim.ollama_client import OllamaClient, OllamaError
 from sim.scenarios import load_scenario
@@ -31,18 +32,28 @@ from sim.speech_to_text import (
 )
 from sim.storage import save_result
 from sim.terminal_ui import choose_scenario, print_feedback, print_scenarios
-from sim.text_to_speech import create_speech_stream, stop_speaking
+from sim.text_to_speech import configure_tts, create_speech_stream, stop_speaking
 
 
 DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Terminal voice demo for the nursing simulation app.")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama model to use. Default: {DEFAULT_MODEL}")
-    parser.add_argument("--host", default="http://localhost:11434", help="Ollama host URL.")
+    parser = argparse.ArgumentParser(
+        description="Terminal voice demo for the nursing simulation app."
+    )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help=f"Ollama model to use. Default: {DEFAULT_MODEL}",
+    )
+    parser.add_argument(
+        "--host", default="http://localhost:11434", help="Ollama host URL."
+    )
     parser.add_argument("--scenario", default=None, help="Scenario ID to run.")
-    parser.add_argument("--list", action="store_true", help="List available scenarios and exit.")
+    parser.add_argument(
+        "--list", action="store_true", help="List available scenarios and exit."
+    )
     parser.add_argument(
         "--stt-model",
         default=DEFAULT_STT_MODEL,
@@ -65,6 +76,32 @@ def main() -> None:
         default=DEFAULT_MAX_RECORDING_SECONDS,
         help=f"Maximum automatic recording length. Default: {DEFAULT_MAX_RECORDING_SECONDS:g} seconds.",
     )
+    parser.add_argument(
+        "--tts-provider",
+        choices=("zonos2", "chatterbox_nano", "edge"),
+        default=os.environ.get("LOCAL_TTS_PROVIDER", DEFAULT_TTS_PROVIDER),
+        help="Patient speech provider. ZONOS2 and Chatterbox run locally.",
+    )
+    parser.add_argument(
+        "--tts-voice",
+        default=os.environ.get("LOCAL_TTS_VOICE", "default"),
+        help="Approved voice ID from the local voice catalog or ZONOS2 server.",
+    )
+    parser.add_argument(
+        "--zonos2-url",
+        default=os.environ.get("ZONOS2_URL", DEFAULT_ZONOS2_URL),
+        help="University-hosted ZONOS2 server URL.",
+    )
+    parser.add_argument(
+        "--voice-catalog",
+        default=os.environ.get("TTS_VOICE_CATALOG", "voices"),
+        help="Directory containing approved voice reference recordings.",
+    )
+    parser.add_argument(
+        "--allow-online-edge-fallback",
+        action="store_true",
+        help="Allow patient text to be sent to legacy online Edge TTS if local speech fails.",
+    )
     args = parser.parse_args()
 
     if args.end_silence_ms <= 0:
@@ -84,12 +121,30 @@ def main() -> None:
 
     client = OllamaClient(model=args.model, host=args.host)
     session = SimulationSession(scenario, client)
+    configure_tts(
+        TTSConfig(
+            provider=args.tts_provider,
+            voice=args.tts_voice,
+            zonos2_url=args.zonos2_url,
+            voice_catalog_dir=args.voice_catalog,
+            allow_online_edge_fallback=args.allow_online_edge_fallback,
+        )
+    )
     stt_preload = _start_stt_preload(args.stt_model)
     ollama_preload = _start_ollama_preload(client)
     manual_recording = bool(args.manual_stop)
 
     print(f"\nScenario: {scenario.title}")
     print(f"Setting: {scenario.setting}")
+    print(f"Patient voice: {args.tts_provider} / {args.tts_voice}")
+    if args.tts_provider == "edge" or args.allow_online_edge_fallback:
+        print(
+            "Privacy notice: legacy Edge TTS sends patient text to an online service."
+        )
+    else:
+        print(
+            "Patient speech is generated locally; no patient text is sent to a TTS provider."
+        )
     if manual_recording:
         print("Press Enter to start recording and Enter again to stop.")
     else:
@@ -103,7 +158,9 @@ def main() -> None:
     try:
         _await_ollama_preload(ollama_preload)
         opening_started = time.perf_counter()
-        opening_prompt_char_count = session.opening_prompt_char_count(response_mode="voice")
+        opening_prompt_char_count = session.opening_prompt_char_count(
+            response_mode="voice"
+        )
         opening_chunk_timing: dict[str, float] = {}
         _print_role_prefix(scenario.role)
         opening_speech_stream = create_speech_stream()
@@ -114,7 +171,7 @@ def main() -> None:
         )
         generation_finished = time.perf_counter()
         _finish_streamed_response()
-        opening_speech_stream.finish()
+        opening_speech_stream.finish(session.transcript[-1].delivery)
         opening_metrics: dict[str, Any] = {
             "llm_response_generation_seconds": _round_seconds(
                 generation_finished - generation_started
@@ -210,13 +267,17 @@ def main() -> None:
             )
             generation_finished = time.perf_counter()
             _finish_streamed_response()
-            speech_stream.finish()
+            speech_stream.finish(session.transcript[-1].delivery)
 
             first_token_at = chunk_timing.get("first_token_at")
             turn_metrics: dict[str, Any] = {
                 "recording_wall_time_seconds": _round_seconds(recording_seconds),
-                "captured_audio_duration_seconds": _round_seconds(recorded_audio.captured_seconds),
-                "detected_speech_duration_seconds": _round_seconds(recorded_audio.speech_seconds),
+                "captured_audio_duration_seconds": _round_seconds(
+                    recorded_audio.captured_seconds
+                ),
+                "detected_speech_duration_seconds": _round_seconds(
+                    recorded_audio.speech_seconds
+                ),
                 "end_of_speech_detection_delay_seconds": _round_seconds(endpoint_delay),
                 "recording_stop_reason": recorded_audio.stop_reason,
                 "speech_to_text_processing_seconds": _round_seconds(
@@ -259,7 +320,9 @@ def main() -> None:
         _finalize_audio_metrics(pending_audio_trackers)
         refresh_latency_summary(saved_latency)
         feedback = evaluate_transcript(scenario, session.transcript, client)
-        path = save_result(scenario, session.transcript, feedback, latency=saved_latency)
+        path = save_result(
+            scenario, session.transcript, feedback, latency=saved_latency
+        )
         print_feedback(feedback)
         print(f"\nSaved transcript and feedback: {path}")
     except KeyboardInterrupt:
@@ -314,9 +377,11 @@ def _track_audio_completion(
         speech_metrics = speech_stream.metrics()
         metrics["audio_status"] = speech_metrics.status
         metrics["audio_segments_started"] = speech_metrics.segments_started
-        metrics[f"{metric_prefix}_to_first_tts_segment_seconds"] = _duration_from_timestamp(
-            speech_metrics.first_segment_submitted_at,
-            origin,
+        metrics[f"{metric_prefix}_to_first_tts_segment_seconds"] = (
+            _duration_from_timestamp(
+                speech_metrics.first_segment_submitted_at,
+                origin,
+            )
         )
         metrics[f"{metric_prefix}_to_first_audio_seconds"] = _duration_from_timestamp(
             speech_metrics.first_audio_started_at,
@@ -418,7 +483,9 @@ def _record_voice_turn(
             False,
         )
     except VoiceActivityDetectionUnavailable as exc:
-        print(f"Voice activity detection unavailable ({exc}). Falling back to manual stop.")
+        print(
+            f"Voice activity detection unavailable ({exc}). Falling back to manual stop."
+        )
         print("\nRecording... press Enter to stop.\n")
         return _record_until_enter(), True
 
@@ -444,7 +511,9 @@ def _record_until_enter() -> RecordedAudio:
         worker.join(timeout=5.0)
 
     if worker.is_alive():
-        raise AudioRecordingError("Microphone recording did not stop cleanly. Try again.")
+        raise AudioRecordingError(
+            "Microphone recording did not stop cleanly. Try again."
+        )
     if "exception" in error:
         raise error["exception"]
     if "audio" not in result:

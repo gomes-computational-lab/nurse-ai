@@ -32,6 +32,22 @@ ollama pull llama3.1
 
 If `faster-whisper` does not install cleanly on Python 3.14, use a Python 3.11 or 3.12 virtual environment for the voice demo.
 
+### Local patient voice setup
+
+Patient speech is local-first and uses only permissively licensed components:
+
+- **ZONOS2 (MIT)** is the preferred university GPU option. Run its server on a university-controlled Linux/NVIDIA host and set `ZONOS2_URL` to that private address. For a non-private hostname, add it to the comma-separated `TTS_ALLOWED_HOSTS` environment variable.
+- **Chatterbox Nano (MIT)** is the laptop fallback. Install it separately because its PyTorch dependencies are large:
+
+```bash
+python3 -m pip install -r requirements-tts.txt
+```
+
+Chatterbox downloads its model during first setup and can run offline afterward. Add only licensed or explicitly consented reference recordings to `voices/`; the filename becomes the selectable voice ID. No reference recordings are committed with this project.
+Use Python 3.11 for the optional Chatterbox environment, matching the upstream project's tested configuration.
+
+The legacy Edge provider remains available for compatibility, but it is online. It is never an automatic fallback unless the user explicitly enables **Allow online Edge fallback** or passes `--allow-online-edge-fallback`.
+
 ## Run The Text Simulation
 
 ```bash
@@ -64,17 +80,17 @@ Start Ollama, then launch the Streamlit interface:
 streamlit run streamlit_app.py
 ```
 
-Choose the scenario, Ollama model, Whisper model, and whether patient audio is enabled in
-the sidebar. After starting the simulation, the browser automatically starts recording
+Choose the scenario, Ollama model, Whisper model, local patient voice engine, approved voice,
+and whether patient audio is enabled in the sidebar. After starting the simulation, the browser automatically starts recording
 when the patient finishes speaking. The nurse has five seconds to begin; after speech is
 detected, three seconds of silence stops the recording. Recorded responses are transcribed
 into an editable draft; you can also type a response directly.
 Review the text and select **Send response** when it is ready.
 
 The browser will ask for microphone permission on the first turn. Browser capture uses
-the browser's supported Opus audio format for speech recognition. Patient audio is
-synthesized as MP3 with Edge TTS and played by the browser; it requires internet access, and browser autoplay
-policies may require you to press the player's play button. If transcription, Ollama, or
+the browser's supported Opus audio format for speech recognition. Local patient audio is
+synthesized as WAV and played by the browser. Browser autoplay policies may require you to
+press the player's play button. If transcription, Ollama, or
 TTS fails, the page reports the error without crashing the active simulation.
 
 Use **End simulation** to generate feedback and save the result, or **New simulation** to
@@ -98,6 +114,13 @@ Change the Ollama model or faster-whisper model:
 python3 main.py --voice --model llama3.1 --stt-model tiny.en
 ```
 
+Select the local patient voice provider:
+
+```bash
+python3 main.py --voice --tts-provider zonos2 --zonos2-url http://10.0.0.20:1919 --tts-voice patient-a
+python3 main.py --voice --tts-provider chatterbox_nano --tts-voice patient-a
+```
+
 Voice demo behavior:
 
 - wait for the patient audio to finish, then press `Enter` to start speaking
@@ -114,19 +137,28 @@ python3 main.py --voice --manual-stop
 
 Automatic recording can be tuned with `--end-silence-ms` and `--max-recording-seconds`. It uses 30 ms WebRTC VAD frames, keeps 300 ms of audio before detected speech, waits up to 10 seconds for speech, and limits a turn to 60 seconds by default. If WebRTC VAD cannot initialize, the demo prints a warning and falls back to manual stop.
 
-Patient responses now use a cross-platform TTS path powered by `edge-tts` with local playback through `pygame`. Spoken output requires internet access for synthesis. If the TTS dependencies are missing or speech playback fails, the demo continues with printed output only and shows a one-time warning.
-
-Generated text is sent to TTS incrementally while Ollama is still responding. Synthesis of upcoming segments overlaps current playback, and punctuation is preserved for more natural pacing. Voice responses are limited to one to three short spoken sentences so audio can start sooner.
-
-To reduce the delay before speech, the first TTS segment starts at a natural clause or at roughly 64 generated characters. Later segments remain longer for smoother prosody, and their synthesis overlaps current playback.
+Ollama streams patient wording to the screen immediately, while a hidden validated delivery header carries emotion, intensity, and pace. The header is removed from displayed text, spoken wording, conversation context, and evaluator input. The complete one-to-three-sentence response is then synthesized as one utterance for smoother prosody.
 
 Optional TTS environment variables:
 
-- `TTS_VOICE` defaults to `en-US-AriaNeural`
-- `TTS_RATE` defaults to `+0%`
-- `TTS_FIRST_SEGMENT_CHARS` defaults to `64`; lower values start synthesis sooner but can sound less smooth
+- `LOCAL_TTS_PROVIDER` is `zonos2`, `chatterbox_nano`, or `edge`; default `zonos2`
+- `LOCAL_TTS_VOICE` defaults to `default`
+- `ZONOS2_URL` defaults to `http://localhost:1919`
+- `TTS_VOICE_CATALOG` defaults to `voices`
+- `TTS_ALLOWED_HOSTS` authorizes comma-separated university hostnames in addition to localhost, private IPs, and `.local` hosts
+- `ALLOW_ONLINE_EDGE_TTS=1` explicitly permits online Edge fallback
+- `TTS_VOICE` and `TTS_RATE` configure the legacy Edge voice
 
-Microphone capture, end-of-speech detection, transcription, and Ollama generation remain local. Edge TTS synthesis uses the network.
+Microphone capture, endpoint detection, transcription, Ollama, and local TTS remain on university-controlled hardware. The UI clearly discloses that patient speech is AI-generated and reports the provider or fallback used.
+
+Benchmark either local provider and create numbered files for a blinded listening review:
+
+```bash
+python3 -m scripts.benchmark_tts --provider zonos2 --voice patient-a --zonos2-url http://10.0.0.20:1919
+python3 -m scripts.benchmark_tts --provider chatterbox_nano --voice patient-a
+```
+
+Results are written under `output/tts_benchmark/` with first-response latency, subsequent median latency, real-time factor, peak memory, anonymous sample filenames, and a separate listening key. Reject any voice mapping that sounds theatrical, introduces words, or obscures clinical information.
 
 Transcripts and feedback are saved in `transcripts/`. Voice results also include recording, endpoint, transcription, first-text, first-audio, completion, and interruption latency metrics.
 
@@ -143,8 +175,8 @@ The most useful metrics are:
 | Metric | Meaning |
 | --- | --- |
 | `speech_end_to_first_audio_seconds` | Main conversational latency: from the student's last detected speech until patient audio starts. Lower is better. |
-| `speech_end_to_first_tts_segment_seconds` | Time until enough generated text is ready to begin the first TTS request. |
-| `first_tts_segment_to_first_audio_seconds` | Edge TTS network synthesis and decoding delay after that first segment is submitted. |
+| `speech_end_to_first_tts_segment_seconds` | Time until the complete patient utterance is ready for its TTS request. |
+| `first_tts_segment_to_first_audio_seconds` | Local synthesis and audio decoding delay after the utterance is submitted. |
 | `speech_end_to_first_text_seconds` | From the student's last detected speech until the first patient text arrives. |
 | `speech_end_to_transcript_ready_seconds` | Endpoint detection and speech-to-text time combined. |
 | `speech_to_text_processing_seconds` | Time faster-whisper spends transcribing the retained audio. |
@@ -166,6 +198,7 @@ sim/
   app.py                Typed terminal app flow
   audio.py              Microphone recording helpers
   evaluator.py          Student-response analysis
+  expressive_tts.py     Local TTS providers, fallback policy, and emotion mappings
   models.py             Shared data structures
   ollama_client.py      Local Ollama HTTP client
   scenarios.py          Scenario loading
@@ -173,7 +206,9 @@ sim/
   terminal_ui.py        Shared terminal helpers
   text_to_speech.py     Cross-platform TTS helpers
   voice_app.py          Voice demo flow
+  voice_delivery.py     Hidden delivery metadata parsing and validation
   web_app.py            Streamlit browser flow
+voices/                 Approved local voice reference catalog
 scenarios/
   post_op_pain.json     Sample nursing scenario
 transcripts/            Generated at runtime

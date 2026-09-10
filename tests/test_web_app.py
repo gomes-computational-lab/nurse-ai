@@ -78,6 +78,11 @@ class StreamlitAppTests(unittest.TestCase):
             )
         )
         self.assertIn("Start simulation", [button.label for button in app.button])
+        self.assertIn("Check voice engine", [button.label for button in app.button])
+        self.assertIn(
+            "Patient voice engine", [selectbox.label for selectbox in app.selectbox]
+        )
+        self.assertTrue(any("AI-generated" in item.value for item in app.caption))
 
     def test_typed_turn_uses_session_and_renders_both_messages(self) -> None:
         patches = self._patch_dependencies()

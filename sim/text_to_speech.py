@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import importlib
 import os
 import queue
@@ -11,6 +10,13 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal, Protocol
+
+from sim.expressive_tts import (
+    SynthesizedAudio,
+    TTSConfig,
+    TTSService,
+)
+from sim.voice_delivery import DEFAULT_DELIVERY, DeliveryStyle
 
 
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
@@ -25,33 +31,22 @@ _synthesis_queue: queue.Queue[tuple[int, str]] = queue.Queue(maxsize=2)
 _playback_queue: queue.Queue[tuple[int, "_PreparedAudio"]] = queue.Queue(maxsize=2)
 _current_session_id = 0
 _workers_started = False
-_SENTENCE_BOUNDARY_PATTERN = re.compile(r"[.!?](?:[\"'”’\)\]]*)\s+")
-_NON_TERMINAL_ABBREVIATION_PATTERN = re.compile(
-    r"(?:\b(?:mr|mrs|ms|dr|prof|sr|jr|st|vs|etc|e\.g|i\.e)|\b[A-Z])\.$",
-    re.IGNORECASE,
-)
-_CLAUSE_BOUNDARY_PATTERN = re.compile(r"[,;:](?:[\"'”’\)\]]*)\s+")
-_NATURAL_SPLIT_PATTERN = re.compile(r"[,;:]\s+|\s+")
 _SPEECH_WHITESPACE_PATTERN = re.compile(r"\s+")
-_MIN_FIRST_SEGMENT_CHARS = 28
-_FIRST_SEGMENT_TARGET_CHARS = max(
-    _MIN_FIRST_SEGMENT_CHARS,
-    int(os.environ.get("TTS_FIRST_SEGMENT_CHARS", "64")),
-)
-_MAX_SEGMENT_CHARS = 160
-_MIN_FALLBACK_SPLIT_CHARS = 80
 _speech_sessions: dict[int, dict[str, object]] = {}
-_TTS_VOICE = os.environ.get("TTS_VOICE", "en-US-AriaNeural")
-_TTS_RATE = os.environ.get("TTS_RATE", "+0%")
 _TTS_UNAVAILABLE = object()
 _backend: "_SpeechBackend | object | None" = None
+_tts_service = TTSService(
+    TTSConfig(
+        provider=os.environ.get("LOCAL_TTS_PROVIDER", "zonos2"),  # type: ignore[arg-type]
+        voice=os.environ.get("LOCAL_TTS_VOICE", "default"),
+        zonos2_url=os.environ.get("ZONOS2_URL", "http://localhost:1919"),
+        voice_catalog_dir=os.environ.get("TTS_VOICE_CATALOG", "voices"),
+        allow_online_edge_fallback=os.environ.get("ALLOW_ONLINE_EDGE_TTS", "0") == "1",
+    )
+)
 
 
 class TextToSpeechError(RuntimeError):
-    pass
-
-
-class TextToSpeechDependencyError(TextToSpeechError):
     pass
 
 
@@ -76,26 +71,21 @@ class _LoadedAudio:
 
 
 class _SpeechBackend(Protocol):
-    def synthesize(self, text: str, cancel_event: threading.Event) -> _PreparedAudio | None:
-        ...
+    def synthesize(
+        self, text: str, style: DeliveryStyle, cancel_event: threading.Event
+    ) -> _PreparedAudio | None: ...
 
-    def load(self, audio: _PreparedAudio) -> object:
-        ...
+    def load(self, audio: _PreparedAudio) -> object: ...
 
-    def play(self, playable: object) -> None:
-        ...
+    def play(self, playable: object) -> None: ...
 
-    def queue(self, playable: object) -> None:
-        ...
+    def queue(self, playable: object) -> None: ...
 
-    def current(self) -> object | None:
-        ...
+    def current(self) -> object | None: ...
 
-    def is_busy(self) -> bool:
-        ...
+    def is_busy(self) -> bool: ...
 
-    def stop(self) -> None:
-        ...
+    def stop(self) -> None: ...
 
 
 class SpeechStream:
@@ -105,7 +95,6 @@ class SpeechStream:
         self._buffer = ""
         self._lock = threading.Lock()
         self._finished = False
-        self._segments_emitted = 0
 
     def add_chunk(self, chunk: str) -> None:
         if not self._enabled or not chunk:
@@ -115,12 +104,8 @@ class SpeechStream:
             if self._finished:
                 return
             self._buffer += chunk
-            ready = self._drain_ready_segments_locked()
 
-        for segment in ready:
-            _enqueue_speech(self._session_id, segment)
-
-    def finish(self) -> None:
+    def finish(self, delivery: DeliveryStyle | None = None) -> None:
         if not self._enabled:
             return
 
@@ -128,13 +113,11 @@ class SpeechStream:
             if self._finished:
                 return
             self._finished = True
-            ready = self._drain_ready_segments_locked()
             remaining = self._buffer.strip()
             self._buffer = ""
 
-        for segment in ready:
-            _enqueue_speech(self._session_id, segment)
         if remaining:
+            _set_session_delivery(self._session_id, delivery or DEFAULT_DELIVERY)
             _enqueue_speech(self._session_id, remaining)
         _mark_session_finished(self._session_id)
 
@@ -178,67 +161,31 @@ class SpeechStream:
                 first_segment_submitted_at=state["first_segment_submitted_at"],
             )
 
-    def _drain_ready_segments_locked(self) -> list[str]:
-        segments: list[str] = []
-        while self._buffer:
-            sentence_end = _sentence_split_index(self._buffer)
-            if sentence_end is not None:
-                segment = self._buffer[:sentence_end].strip()
-                self._buffer = self._buffer[sentence_end:].lstrip()
-                if segment:
-                    segments.append(segment)
-                    self._segments_emitted += 1
-                continue
 
-            if self._segments_emitted == 0:
-                first_segment_end = _first_segment_split_index(self._buffer)
-                if first_segment_end is not None:
-                    segment = self._buffer[:first_segment_end].strip()
-                    self._buffer = self._buffer[first_segment_end:].lstrip()
-                    if segment:
-                        segments.append(segment)
-                        self._segments_emitted += 1
-                    continue
-
-            if len(self._buffer) < _MAX_SEGMENT_CHARS:
-                break
-
-            split_at = _fallback_split_index(self._buffer)
-            segment = self._buffer[:split_at].strip()
-            self._buffer = self._buffer[split_at:].lstrip()
-            if segment:
-                segments.append(segment)
-                self._segments_emitted += 1
-        return segments
-
-    # Kept as a small test hook for callers that previously forced timer flushes.
-    def _flush_ready_segments(self) -> None:
-        if not self._enabled:
-            return
-        with self._lock:
-            ready = self._drain_ready_segments_locked()
-        for segment in ready:
-            _enqueue_speech(self._session_id, segment)
-
-
-class _EdgeTTSBackend:
-    def __init__(self, edge_tts_module, pygame_module):
-        self._communicate = edge_tts_module.Communicate
+class _AudioPlaybackBackend:
+    def __init__(self, pygame_module, service: TTSService):
         self._pygame = pygame_module
+        self._service = service
         self._mixer = pygame_module.mixer
         self._channel_lock = threading.Lock()
         if not self._mixer.get_init():
             self._mixer.init(frequency=24000, channels=1)
         self._channel = self._mixer.find_channel(force=True)
 
-    def synthesize(self, text: str, cancel_event: threading.Event) -> _PreparedAudio | None:
+    def synthesize(
+        self, text: str, style: DeliveryStyle, cancel_event: threading.Event
+    ) -> _PreparedAudio | None:
         if cancel_event.is_set():
             return None
-
-        audio_bytes = asyncio.run(self._synthesize_audio(text, cancel_event))
-        if not audio_bytes or cancel_event.is_set():
+        audio = self._service.synthesize(text, style, cancel_event)
+        if not audio.data or cancel_event.is_set():
             return None
-        return _PreparedAudio(_write_temp_audio_file(audio_bytes))
+        suffix = ".wav" if audio.mime_type == "audio/wav" else ".mp3"
+        if audio.fallback_from is not None:
+            _warn_tts_failure_once(
+                f"TTS notice: {audio.fallback_from} was unavailable; using {audio.provider}."
+            )
+        return _PreparedAudio(_write_temp_audio_file(audio.data, suffix=suffix))
 
     def load(self, audio: _PreparedAudio) -> object:
         return self._mixer.Sound(str(audio.path))
@@ -266,70 +213,6 @@ class _EdgeTTSBackend:
             except Exception:
                 return
 
-    async def _synthesize_audio(self, text: str, cancel_event: threading.Event) -> bytes:
-        synthesis_task = asyncio.create_task(self._collect_audio(text))
-        cancellation_task = asyncio.create_task(self._wait_for_cancellation(cancel_event))
-        done, _ = await asyncio.wait(
-            {synthesis_task, cancellation_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-
-        if cancellation_task in done:
-            synthesis_task.cancel()
-            await asyncio.gather(synthesis_task, return_exceptions=True)
-            return b""
-
-        cancellation_task.cancel()
-        await asyncio.gather(cancellation_task, return_exceptions=True)
-        return await synthesis_task
-
-    async def _collect_audio(self, text: str) -> bytes:
-        communicate = self._communicate(text, _TTS_VOICE, rate=_TTS_RATE)
-        audio_chunks: list[bytes] = []
-        async for chunk in communicate.stream():
-            if chunk.get("type") == "audio":
-                audio_chunks.append(chunk["data"])
-        return b"".join(audio_chunks)
-
-    async def _wait_for_cancellation(self, cancel_event: threading.Event) -> None:
-        while not cancel_event.is_set():
-            await asyncio.sleep(0.02)
-
-
-def _sentence_split_index(text: str) -> int | None:
-    for match in _SENTENCE_BOUNDARY_PATTERN.finditer(text):
-        punctuation_index = match.start()
-        if text[punctuation_index] == "." and _is_non_terminal_period(text, punctuation_index):
-            continue
-        return match.end()
-    return None
-
-
-def _is_non_terminal_period(text: str, punctuation_index: int) -> bool:
-    prefix = text[: punctuation_index + 1]
-    return _NON_TERMINAL_ABBREVIATION_PATTERN.search(prefix) is not None
-
-
-def _first_segment_split_index(text: str) -> int | None:
-    for match in _CLAUSE_BOUNDARY_PATTERN.finditer(text):
-        if match.end() >= _MIN_FIRST_SEGMENT_CHARS:
-            return match.end()
-
-    if len(text) < _FIRST_SEGMENT_TARGET_CHARS:
-        return None
-
-    window = text[:_FIRST_SEGMENT_TARGET_CHARS]
-    candidates = [match.end() for match in _NATURAL_SPLIT_PATTERN.finditer(window)]
-    usable = [index for index in candidates if index >= _MIN_FIRST_SEGMENT_CHARS]
-    return usable[-1] if usable else _FIRST_SEGMENT_TARGET_CHARS
-
-
-def _fallback_split_index(text: str) -> int:
-    window = text[:_MAX_SEGMENT_CHARS]
-    candidates = [match.end() for match in _NATURAL_SPLIT_PATTERN.finditer(window)]
-    usable = [index for index in candidates if index >= _MIN_FALLBACK_SPLIT_CHARS]
-    return usable[-1] if usable else _MAX_SEGMENT_CHARS
-
 
 def speak_text(text: str) -> None:
     if not text.strip():
@@ -340,40 +223,48 @@ def speak_text(text: str) -> None:
     stream.finish()
 
 
-def synthesize_speech_bytes(text: str) -> bytes:
-    """Synthesize one complete MP3 response for playback by a browser client."""
+def synthesize_speech_bytes(
+    text: str,
+    *,
+    delivery: DeliveryStyle | None = None,
+    service: TTSService | None = None,
+) -> bytes:
+    """Synthesize one complete response for playback by a browser client."""
     spoken_text = _normalize_speech_text(text)
     if not spoken_text:
         return b""
 
     try:
-        edge_tts_module = importlib.import_module("edge_tts")
-    except ImportError as exc:
-        raise TextToSpeechDependencyError(
-            "Missing text-to-speech dependency `edge-tts`. "
-            "Install requirements with `pip install -r requirements.txt`."
-        ) from exc
+        audio = (service or _tts_service).synthesize(spoken_text, delivery)
+    except Exception as exc:
+        raise TextToSpeechError(f"Could not synthesize patient audio: {exc}") from exc
+    return audio.data
 
-    async def collect() -> bytes:
-        communicate = edge_tts_module.Communicate(
-            spoken_text,
-            _TTS_VOICE,
-            rate=_TTS_RATE,
+
+def synthesize_patient_audio(
+    text: str,
+    *,
+    delivery: DeliveryStyle | None = None,
+    service: TTSService | None = None,
+) -> SynthesizedAudio:
+    spoken_text = _normalize_speech_text(text)
+    if not spoken_text:
+        raise TextToSpeechError(
+            "Could not synthesize patient audio: response was empty."
         )
-        chunks: list[bytes] = []
-        async for chunk in communicate.stream():
-            if chunk.get("type") == "audio":
-                chunks.append(chunk["data"])
-        return b"".join(chunks)
-
     try:
-        audio = asyncio.run(collect())
+        return (service or _tts_service).synthesize(spoken_text, delivery)
     except Exception as exc:
         raise TextToSpeechError(f"Could not synthesize patient audio: {exc}") from exc
 
-    if not audio:
-        raise TextToSpeechError("Could not synthesize patient audio: no audio was returned.")
-    return audio
+
+def configure_tts(config: TTSConfig) -> TTSService:
+    global _backend, _tts_service
+    stop_speaking()
+    with _backend_lock:
+        _tts_service = TTSService(config)
+        _backend = None
+    return _tts_service
 
 
 def create_speech_stream(
@@ -455,16 +346,15 @@ def _peek_tts_backend() -> _SpeechBackend | None:
 
 def _create_tts_backend() -> _SpeechBackend | None:
     try:
-        edge_tts_module = importlib.import_module("edge_tts")
         pygame_module = importlib.import_module("pygame")
     except ImportError:
         _warn_tts_unavailable_once(
-            "TTS unavailable: install `edge-tts` and `pygame` for cross-platform speech output. Continuing with text output only."
+            "TTS unavailable: install `pygame` for terminal speech playback. Continuing with text output only."
         )
         return None
 
     try:
-        return _EdgeTTSBackend(edge_tts_module, pygame_module)
+        return _AudioPlaybackBackend(pygame_module, _tts_service)
     except Exception as exc:
         _warn_tts_unavailable_once(
             f"TTS unavailable: could not initialize audio playback ({exc}). Continuing with text output only."
@@ -495,6 +385,7 @@ def _begin_speech_session(
             "segments_started": 0,
             "on_playback_start": on_playback_start,
             "on_complete": on_complete,
+            "delivery": DEFAULT_DELIVERY,
         }
     return session_id
 
@@ -550,9 +441,13 @@ def _synthesis_worker() -> None:
             continue
 
         try:
-            prepared = backend.synthesize(text, cancel_event)
+            prepared = backend.synthesize(
+                text, _session_delivery(session_id), cancel_event
+            )
         except Exception as exc:
-            _warn_tts_failure_once(f"TTS warning: could not synthesize response ({exc}). Continuing without audio.")
+            _warn_tts_failure_once(
+                f"TTS warning: could not synthesize response ({exc}). Continuing without audio."
+            )
             _mark_session_failed(session_id)
             _mark_segment_done(session_id)
             continue
@@ -659,7 +554,9 @@ def _playback_worker() -> None:
                 _finish_loaded_segment(session_id, active)
             if queued is not None:
                 _finish_loaded_segment(session_id, queued)
-            _warn_tts_failure_once(f"TTS warning: could not play response ({exc}). Continuing without audio.")
+            _warn_tts_failure_once(
+                f"TTS warning: could not play response ({exc}). Continuing without audio."
+            )
 
 
 def _finish_loaded_segment(session_id: int, loaded: _LoadedAudio) -> None:
@@ -702,12 +599,28 @@ def _session_cancel_event(session_id: int) -> threading.Event | None:
         return state["cancel_event"] if state is not None else None
 
 
+def _set_session_delivery(session_id: int, delivery: DeliveryStyle) -> None:
+    with _speech_lock:
+        state = _speech_sessions.get(session_id)
+        if state is not None:
+            state["delivery"] = delivery
+
+
+def _session_delivery(session_id: int) -> DeliveryStyle:
+    with _speech_lock:
+        state = _speech_sessions.get(session_id)
+        if state is None:
+            return DEFAULT_DELIVERY
+        delivery = state.get("delivery")
+        return delivery if isinstance(delivery, DeliveryStyle) else DEFAULT_DELIVERY
+
+
 def _normalize_speech_text(text: str) -> str:
     return _SPEECH_WHITESPACE_PATTERN.sub(" ", text).strip()
 
 
-def _write_temp_audio_file(audio_bytes: bytes) -> Path:
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_file:
+def _write_temp_audio_file(audio_bytes: bytes, *, suffix: str = ".mp3") -> Path:
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
         temp_file.write(audio_bytes)
         return Path(temp_file.name)
 

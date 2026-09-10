@@ -1,0 +1,3 @@
+# Optional local, offline patient speech for laptop installations.
+# Chatterbox code and model weights are MIT licensed.
+chatterbox-tts

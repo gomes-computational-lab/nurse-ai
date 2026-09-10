@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from sim.voice_delivery import DeliveryStyle
+
 
 @dataclass(frozen=True)
 class Scenario:
@@ -23,7 +25,10 @@ class Scenario:
 class Message:
     role: str
     content: str
-    created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    delivery: DeliveryStyle | None = None
+    created_at: str = field(
+        default_factory=lambda: datetime.now().isoformat(timespec="seconds")
+    )
 
 
 @dataclass
@@ -31,4 +36,3 @@ class SimulationResult:
     scenario_id: str
     transcript: list[Message]
     feedback: dict[str, Any] | None = None
-

@@ -10,6 +10,14 @@ from sim.browser_recorder import (
     ensure_browser_recorder_registered,
 )
 from sim.evaluator import evaluate_transcript
+from sim.expressive_tts import (
+    DEFAULT_TTS_PROVIDER,
+    DEFAULT_ZONOS2_URL,
+    SynthesizedAudio,
+    TTSConfig,
+    TTSService,
+    list_approved_voices,
+)
 from sim.ollama_client import OllamaClient, OllamaError
 from sim.scenarios import list_scenarios
 from sim.session import SimulationSession
@@ -19,7 +27,7 @@ from sim.speech_to_text import (
     transcribe_audio_bytes,
 )
 from sim.storage import save_result
-from sim.text_to_speech import TextToSpeechError, synthesize_speech_bytes
+from sim.text_to_speech import TextToSpeechError, synthesize_patient_audio
 
 
 DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
@@ -38,11 +46,15 @@ STATE_DEFAULTS: dict[str, Any] = {
     "saved_path": None,
     "simulation_ended": False,
     "tts_warning": None,
+    "tts_provider_status": None,
+    "tts_health_report": None,
 }
 
 
 def main() -> None:
-    st.set_page_config(page_title="Nursing AI Simulation", page_icon="🩺", layout="centered")
+    st.set_page_config(
+        page_title="Nursing AI Simulation", page_icon="🩺", layout="centered"
+    )
     ensure_browser_recorder_registered()
     _initialize_state()
 
@@ -65,6 +77,8 @@ def main() -> None:
 
     if st.session_state.tts_warning:
         st.warning(st.session_state.tts_warning)
+    if st.session_state.tts_provider_status:
+        st.caption(st.session_state.tts_provider_status)
 
     if st.session_state.simulation_ended:
         _render_feedback()
@@ -102,17 +116,60 @@ def _render_sidebar() -> dict[str, Any]:
             disabled=active,
         )
         patient_audio = st.toggle("Patient browser audio", value=True, disabled=active)
+        provider_labels = {
+            "zonos2": "ZONOS2 — university GPU",
+            "chatterbox_nano": "Chatterbox Nano — this computer",
+            "edge": "Legacy Edge — online",
+        }
+        provider = st.selectbox(
+            "Patient voice engine",
+            tuple(provider_labels),
+            index=tuple(provider_labels).index(
+                os.environ.get("LOCAL_TTS_PROVIDER", DEFAULT_TTS_PROVIDER)
+            )
+            if os.environ.get("LOCAL_TTS_PROVIDER", DEFAULT_TTS_PROVIDER)
+            in provider_labels
+            else 0,
+            format_func=provider_labels.get,
+            disabled=active,
+        )
+        catalog_dir = os.environ.get("TTS_VOICE_CATALOG", "voices")
+        voices = ["default", *list_approved_voices(catalog_dir)]
+        voice = st.selectbox(
+            "Approved patient voice",
+            voices,
+            disabled=active,
+            help="Add only licensed or consented recordings to the local voices directory.",
+        )
+        zonos2_url = st.text_input(
+            "University ZONOS2 URL",
+            value=os.environ.get("ZONOS2_URL", DEFAULT_ZONOS2_URL),
+            disabled=active,
+        )
+        allow_edge_fallback = st.toggle(
+            "Allow online Edge fallback",
+            value=False,
+            disabled=active or provider == "edge",
+            help="Off by default. Enabling this may send generated patient text outside the university.",
+        )
+        if provider == "edge" or allow_edge_fallback:
+            st.warning(
+                "Legacy Edge TTS is online and does not meet offline-only privacy mode."
+            )
 
         with st.expander("Setup help", icon=":material/help:"):
             st.markdown(
                 "1. Start Ollama on this computer.\n"
                 "2. Confirm the selected Ollama model is installed.\n"
                 "3. Keep the default host unless Ollama runs elsewhere.\n"
-                "4. Allow microphone access when the browser asks."
+                "4. Choose the university ZONOS2 server or install Chatterbox Nano locally.\n"
+                "5. Allow microphone access when the browser asks."
             )
             st.code("ollama serve\nollama pull llama3.1", language="bash")
             st.caption(
-                "Microphone capture works on localhost or a secure HTTPS connection."
+                "Local voice models are downloaded once during setup and run offline afterward. "
+                "Add university DNS names to `TTS_ALLOWED_HOSTS`. Microphone capture works on "
+                "localhost or a secure HTTPS connection."
             )
 
         config = {
@@ -121,7 +178,30 @@ def _render_sidebar() -> dict[str, Any]:
             "host": host.strip(),
             "stt_model": stt_model.strip(),
             "patient_audio": patient_audio,
+            "tts_provider": provider,
+            "tts_voice": voice,
+            "zonos2_url": zonos2_url.strip(),
+            "voice_catalog_dir": catalog_dir,
+            "allow_online_edge_fallback": allow_edge_fallback,
         }
+
+        if not active and st.button("Check voice engine", width="stretch"):
+            service = _get_tts_service(
+                provider,
+                voice,
+                zonos2_url.strip(),
+                catalog_dir,
+                allow_edge_fallback,
+            )
+            st.session_state.tts_health_report = service.capabilities()
+
+        if not active and st.session_state.tts_health_report:
+            for capability in st.session_state.tts_health_report:
+                status = "Available" if capability.available else "Unavailable"
+                locality = "local" if capability.local else "online"
+                st.caption(
+                    f"{capability.provider}: {status} ({locality}) — {capability.detail}"
+                )
 
         if not active:
             if st.button("Start simulation", type="primary", width="stretch"):
@@ -155,14 +235,16 @@ def _render_getting_started() -> None:
         st.markdown(
             "1. **Start Ollama** and make sure the model selected in the sidebar is available.\n"
             "2. **Choose a scenario** and decide whether patient audio should play.\n"
-            "3. **Select Start simulation**, then allow microphone access in your browser.\n"
-            "4. **Listen to the patient.** Recording begins automatically when the patient finishes.\n"
-            "5. **Begin speaking within five seconds**, then stay quiet for three seconds when finished.\n"
-            "6. **Review the transcription** and select **Send response**."
+            "3. **Choose a local voice engine.** ZONOS2 uses the university GPU server; "
+            "Chatterbox Nano runs on this computer.\n"
+            "4. **Select Start simulation**, then allow microphone access in your browser.\n"
+            "5. **Listen to the patient.** Recording begins automatically when the patient finishes.\n"
+            "6. **Begin speaking within five seconds**, then stay quiet for three seconds when finished.\n"
+            "7. **Review the transcription** and select **Send response**."
         )
         st.caption(
-            "If browser autoplay is blocked, play the patient audio manually and then select "
-            "Start recording. You can always type or edit your response."
+            "Patient voices are AI-generated. In offline mode, patient text and audio remain on "
+            "the university server or this computer. You can always type or edit your response."
         )
 
 
@@ -193,7 +275,7 @@ def _start_simulation(config: dict[str, Any]) -> bool:
 
 def _render_transcript() -> None:
     session: SimulationSession = st.session_state.simulation_session
-    audio_by_message: dict[int, bytes] = st.session_state.patient_audio
+    audio_by_message: dict[int, SynthesizedAudio] = st.session_state.patient_audio
     for index, message in enumerate(session.transcript):
         chat_role = "user" if message.role == "student" else "assistant"
         avatar = "🧑‍⚕️" if message.role == "student" else "🧑"
@@ -202,10 +284,11 @@ def _render_transcript() -> None:
             audio = audio_by_message.get(index)
             if audio:
                 st.audio(
-                    audio,
-                    format="audio/mpeg",
+                    audio.data,
+                    format=audio.mime_type,
                     autoplay=False,
                 )
+
 
 def _render_composer() -> None:
     st.divider()
@@ -247,7 +330,10 @@ def _render_composer() -> None:
     already_processed = st.session_state.processed_recording_turn == turn_id
     recording, recorder_error = automatic_silence_recorder(
         turn_id=turn_id,
-        patient_audio=patient_audio,
+        patient_audio=patient_audio.data if patient_audio else None,
+        patient_audio_mime_type=patient_audio.mime_type
+        if patient_audio
+        else "audio/mpeg",
         key=f"student_recorder_{turn_id}",
         active=not already_processed,
     )
@@ -332,12 +418,50 @@ def _add_patient_audio(message_index: int, response: str) -> None:
         return
     try:
         with st.spinner("Preparing patient audio..."):
-            audio = synthesize_speech_bytes(response)
-        if audio:
+            config = st.session_state.simulation_config
+            service = _get_tts_service(
+                config["tts_provider"],
+                config["tts_voice"],
+                config["zonos2_url"],
+                config["voice_catalog_dir"],
+                config["allow_online_edge_fallback"],
+            )
+            session: SimulationSession = st.session_state.simulation_session
+            audio = synthesize_patient_audio(
+                response,
+                delivery=session.transcript[message_index].delivery,
+                service=service,
+            )
+        if audio.data:
             st.session_state.patient_audio[message_index] = audio
             st.session_state.tts_warning = None
+            if audio.fallback_from:
+                st.session_state.tts_provider_status = f"Patient voice: {audio.provider} (fallback from {audio.fallback_from})."
+            else:
+                st.session_state.tts_provider_status = (
+                    f"Patient voice: {audio.provider}."
+                )
     except TextToSpeechError as exc:
         st.session_state.tts_warning = f"{exc} Continuing with text only."
+
+
+@st.cache_resource(max_entries=8)
+def _get_tts_service(
+    provider: str,
+    voice: str,
+    zonos2_url: str,
+    voice_catalog_dir: str,
+    allow_online_edge_fallback: bool,
+) -> TTSService:
+    return TTSService(
+        TTSConfig(
+            provider=provider,  # type: ignore[arg-type]
+            voice=voice,
+            zonos2_url=zonos2_url,
+            voice_catalog_dir=voice_catalog_dir,
+            allow_online_edge_fallback=allow_online_edge_fallback,
+        )
+    )
 
 
 def _end_simulation() -> bool:

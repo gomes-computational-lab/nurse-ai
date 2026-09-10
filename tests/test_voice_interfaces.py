@@ -9,7 +9,8 @@ from unittest.mock import patch
 import numpy as np
 
 from sim.audio import RecordedAudio, VoiceActivityDetectionUnavailable
-from sim.models import Scenario
+from sim.expressive_tts import SynthesizedAudio
+from sim.models import Message, Scenario
 from sim.ollama_client import OllamaClient
 from sim.session import SimulationSession, VOICE_MAX_TOKENS
 from sim.speech_to_text import transcribe_audio, transcribe_audio_bytes
@@ -56,7 +57,9 @@ def scenario() -> Scenario:
 
 
 class VoiceInterfaceTests(unittest.TestCase):
-    def test_voice_loop_waits_for_patient_audio_before_accepting_student_input(self) -> None:
+    def test_voice_loop_waits_for_patient_audio_before_accepting_student_input(
+        self,
+    ) -> None:
         from sim.voice_app import main as voice_main
 
         class FakeStream:
@@ -67,7 +70,8 @@ class VoiceInterfaceTests(unittest.TestCase):
             def add_chunk(self, chunk):
                 del chunk
 
-            def finish(self):
+            def finish(self, delivery=None):
+                del delivery
                 self.finished = True
 
             def wait_until_done(self):
@@ -85,6 +89,9 @@ class VoiceInterfaceTests(unittest.TestCase):
             def opening(self, on_chunk, **kwargs):
                 del kwargs
                 on_chunk("Opening response.")
+                self.transcript.append(
+                    Message(role="patient", content="Opening response.")
+                )
                 return "Opening response."
 
             def response_prompt_char_count(self, *args, **kwargs):
@@ -94,6 +101,9 @@ class VoiceInterfaceTests(unittest.TestCase):
             def respond(self, student_response, on_chunk, **kwargs):
                 del student_response, kwargs
                 on_chunk("Patient response.")
+                self.transcript.append(
+                    Message(role="patient", content="Patient response.")
+                )
                 return "Patient response."
 
         streams = [FakeStream(), FakeStream()]
@@ -118,7 +128,9 @@ class VoiceInterfaceTests(unittest.TestCase):
             patch("sim.voice_app.create_speech_stream", side_effect=streams),
             patch("sim.voice_app._track_audio_completion", return_value=object()),
             patch("sim.voice_app._read_voice_action", side_effect=["speak", "quit"]),
-            patch("sim.voice_app._record_voice_turn", return_value=(recorded_audio, False)),
+            patch(
+                "sim.voice_app._record_voice_turn", return_value=(recorded_audio, False)
+            ),
             patch("sim.voice_app.transcribe_audio", return_value="Hello"),
             patch("sim.voice_app.stop_speaking") as stop_speaking,
             patch("sim.voice_app._finalize_audio_metrics"),
@@ -169,7 +181,9 @@ class VoiceInterfaceTests(unittest.TestCase):
         self.assertEqual(result, "")
         transcribe.assert_not_called()
 
-    def test_browser_audio_temp_file_is_cleaned_after_transcription_failure(self) -> None:
+    def test_browser_audio_temp_file_is_cleaned_after_transcription_failure(
+        self,
+    ) -> None:
         observed_path: Path | None = None
 
         def fail(path, *, model_name):
@@ -185,49 +199,41 @@ class VoiceInterfaceTests(unittest.TestCase):
         self.assertIsNotNone(observed_path)
         self.assertFalse(observed_path.exists())
 
-    def test_browser_tts_returns_mp3_bytes(self) -> None:
+    def test_browser_tts_returns_provider_audio_bytes(self) -> None:
         import sim.text_to_speech as tts
 
-        class Communicate:
-            def __init__(self, text, voice, rate):
-                self.options = (text, voice, rate)
+        class Service:
+            def synthesize(self, text, delivery):
+                self.options = (text, delivery)
+                return SynthesizedAudio(b"audio", "audio/wav", "zonos2")
 
-            async def stream(self):
-                yield {"type": "metadata", "data": b"ignored"}
-                yield {"type": "audio", "data": b"first"}
-                yield {"type": "audio", "data": b"second"}
+        result = tts.synthesize_speech_bytes(
+            "  Patient says hello.  ", service=Service()
+        )
 
-        edge_tts = type("EdgeTTS", (), {"Communicate": Communicate})
-        with patch("sim.text_to_speech.importlib.import_module", return_value=edge_tts):
-            result = tts.synthesize_speech_bytes("  Patient says hello.  ")
+        self.assertEqual(result, b"audio")
 
-        self.assertEqual(result, b"firstsecond")
-
-    def test_browser_tts_reports_missing_dependency(self) -> None:
+    def test_browser_tts_reports_provider_failure(self) -> None:
         import sim.text_to_speech as tts
 
-        with patch(
-            "sim.text_to_speech.importlib.import_module",
-            side_effect=ImportError("missing"),
-        ):
-            with self.assertRaises(tts.TextToSpeechDependencyError):
-                tts.synthesize_speech_bytes("Hello")
+        class Service:
+            def synthesize(self, text, delivery):
+                del text, delivery
+                raise RuntimeError("missing local model")
+
+        with self.assertRaisesRegex(tts.TextToSpeechError, "missing local model"):
+            tts.synthesize_speech_bytes("Hello", service=Service())
 
     def test_browser_tts_rejects_empty_audio_response(self) -> None:
         import sim.text_to_speech as tts
 
-        class Communicate:
-            def __init__(self, *args, **kwargs):
-                del args, kwargs
+        class Service:
+            def synthesize(self, text, delivery):
+                del text, delivery
+                raise RuntimeError("no audio")
 
-            async def stream(self):
-                if False:
-                    yield {}
-
-        edge_tts = type("EdgeTTS", (), {"Communicate": Communicate})
-        with patch("sim.text_to_speech.importlib.import_module", return_value=edge_tts):
-            with self.assertRaisesRegex(tts.TextToSpeechError, "no audio"):
-                tts.synthesize_speech_bytes("Hello")
+        with self.assertRaisesRegex(tts.TextToSpeechError, "no audio"):
+            tts.synthesize_speech_bytes("Hello", service=Service())
 
     def test_voice_mode_adds_spoken_prompt_and_token_limit(self) -> None:
         client = FakeClient()
@@ -239,7 +245,31 @@ class VoiceInterfaceTests(unittest.TestCase):
         self.assertEqual(call["max_tokens"], VOICE_MAX_TOKENS)
         system_prompt = call["messages"][0]["content"]
         self.assertIn("one to three short", system_prompt)
+        self.assertIn("[[delivery]]", system_prompt)
         self.assertIn("Do not use Markdown", system_prompt)
+
+    def test_voice_mode_strips_delivery_header_from_stream_and_transcript(self) -> None:
+        class DeliveryClient:
+            def chat(self, messages, **kwargs):
+                del messages
+                response = (
+                    '[[delivery]]{"emotion":"in_pain","intensity":2,"pace":"slow"}'
+                    "[[/delivery]]\nIt hurts when I breathe."
+                )
+                callback = kwargs.get("on_chunk")
+                callback(response[:18])
+                callback(response[18:])
+                return response
+
+        visible = []
+        session = SimulationSession(scenario(), DeliveryClient())
+
+        response = session.opening(visible.append, response_mode="voice")
+
+        self.assertEqual(response, "It hurts when I breathe.")
+        self.assertEqual("".join(visible), response)
+        self.assertNotIn("delivery", session.transcript[0].content)
+        self.assertEqual(session.transcript[0].delivery.emotion, "in_pain")
 
     def test_text_mode_keeps_unlimited_generation_and_original_prompt(self) -> None:
         client = FakeClient()
@@ -270,7 +300,9 @@ class VoiceInterfaceTests(unittest.TestCase):
             return Response()
 
         client = OllamaClient("model")
-        with patch("sim.ollama_client.urllib.request.urlopen", side_effect=fake_urlopen):
+        with patch(
+            "sim.ollama_client.urllib.request.urlopen", side_effect=fake_urlopen
+        ):
             result = client.chat([{"role": "user", "content": "Hi"}], max_tokens=80)
 
         self.assertEqual(result, "ok")

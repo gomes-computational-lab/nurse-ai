@@ -4,10 +4,15 @@ from typing import Callable, Literal
 
 from sim.models import Message, Scenario
 from sim.ollama_client import OllamaClient
+from sim.voice_delivery import (
+    DeliveryStreamParser,
+    DeliveryStyle,
+    parse_delivery_response,
+)
 
 
 ResponseMode = Literal["text", "voice"]
-VOICE_MAX_TOKENS = 80
+VOICE_MAX_TOKENS = 120
 
 
 class SimulationSession:
@@ -22,13 +27,12 @@ class SimulationSession:
         *,
         response_mode: ResponseMode = "text",
     ) -> str:
-        response = self.client.chat(
-            self._patient_messages(response_mode=response_mode),
-            temperature=0.75,
-            max_tokens=VOICE_MAX_TOKENS if response_mode == "voice" else None,
-            on_chunk=on_chunk,
+        response, delivery = self._patient_chat(
+            self._patient_messages(response_mode=response_mode), on_chunk, response_mode
         )
-        self.transcript.append(Message(role="patient", content=response))
+        self.transcript.append(
+            Message(role="patient", content=response, delivery=delivery)
+        )
         return response
 
     def respond(
@@ -43,17 +47,46 @@ class SimulationSession:
             response_mode=response_mode,
         )
         self.transcript.append(Message(role="student", content=student_response))
-        response = self.client.chat(
-            messages,
-            temperature=0.75,
-            max_tokens=VOICE_MAX_TOKENS if response_mode == "voice" else None,
-            on_chunk=on_chunk,
+        response, delivery = self._patient_chat(messages, on_chunk, response_mode)
+        self.transcript.append(
+            Message(role="patient", content=response, delivery=delivery)
         )
-        self.transcript.append(Message(role="patient", content=response))
         return response
 
+    def _patient_chat(
+        self,
+        messages: list[dict[str, str]],
+        on_chunk: Callable[[str], None] | None,
+        response_mode: ResponseMode,
+    ) -> tuple[str, DeliveryStyle | None]:
+        if response_mode != "voice":
+            response = self.client.chat(
+                messages, temperature=0.75, max_tokens=None, on_chunk=on_chunk
+            )
+            return response, None
+
+        if on_chunk is None:
+            raw = self.client.chat(
+                messages, temperature=0.75, max_tokens=VOICE_MAX_TOKENS
+            )
+            response, delivery = parse_delivery_response(raw)
+            return response, delivery
+
+        parser = DeliveryStreamParser(on_chunk)
+        raw = self.client.chat(
+            messages,
+            temperature=0.75,
+            max_tokens=VOICE_MAX_TOKENS,
+            on_chunk=parser.add_chunk,
+        )
+        if not parser.received_input:
+            parser.add_chunk(raw)
+        return parser.finish()
+
     def opening_prompt_char_count(self, *, response_mode: ResponseMode = "text") -> int:
-        return self._prompt_char_count(self._patient_messages(response_mode=response_mode))
+        return self._prompt_char_count(
+            self._patient_messages(response_mode=response_mode)
+        )
 
     def response_prompt_char_count(
         self,
@@ -79,6 +112,12 @@ class SimulationSession:
             system_prompt += (
                 "\n\nVoice response style:\n"
                 "- Respond in one to three short, naturally punctuated spoken sentences.\n"
+                "- First output exactly one hidden delivery header in this format:\n"
+                '  [[delivery]]{"emotion":"anxious","intensity":2,"pace":"slow"}[[/delivery]]\n'
+                "- Valid emotions: neutral, anxious, fearful, frustrated, confused, relieved, sad, in_pain, tired.\n"
+                "- Intensity must be 1, 2, or 3. Pace must be slow, normal, or fast.\n"
+                "- Base delivery on the patient's current state and keep it subtle and clinically plausible.\n"
+                "- After the header, output only the words the patient says.\n"
                 "- Do not use Markdown, lists, stage directions, or parenthetical actions."
             )
         messages = [{"role": "system", "content": system_prompt}]
@@ -109,7 +148,9 @@ class SimulationSession:
 
     def _system_prompt(self) -> str:
         behavior = "\n".join(f"- {item}" for item in self.scenario.behavior_guidelines)
-        objectives = "\n".join(f"- {item}" for item in self.scenario.learning_objectives)
+        objectives = "\n".join(
+            f"- {item}" for item in self.scenario.learning_objectives
+        )
         return f"""
 You are role-playing in a nursing education simulation.
 

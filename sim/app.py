@@ -16,11 +16,21 @@ DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Terminal nursing simulation using local Ollama models.")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama model to use. Default: {DEFAULT_MODEL}")
-    parser.add_argument("--host", default="http://localhost:11434", help="Ollama host URL.")
+    parser = argparse.ArgumentParser(
+        description="Terminal nursing simulation using local Ollama models."
+    )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help=f"Ollama model to use. Default: {DEFAULT_MODEL}",
+    )
+    parser.add_argument(
+        "--host", default="http://localhost:11434", help="Ollama host URL."
+    )
     parser.add_argument("--scenario", default=None, help="Scenario ID to run.")
-    parser.add_argument("--list", action="store_true", help="List available scenarios and exit.")
+    parser.add_argument(
+        "--list", action="store_true", help="List available scenarios and exit."
+    )
     args = parser.parse_args()
 
     if args.list:
@@ -42,7 +52,7 @@ def main() -> None:
 
     try:
         _print_role_prefix(scenario.role)
-        patient_text = session.opening(on_chunk=_print_stream_chunk)
+        session.opening(on_chunk=_print_stream_chunk)
         _finish_streamed_response()
 
         while True:
@@ -60,7 +70,7 @@ def main() -> None:
                 break
 
             _print_role_prefix(scenario.role)
-            patient_text = session.respond(student_text, on_chunk=_print_stream_chunk)
+            session.respond(student_text, on_chunk=_print_stream_chunk)
             _finish_streamed_response()
 
         print("\nEvaluating student performance...\n")

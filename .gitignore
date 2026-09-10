@@ -5,5 +5,7 @@ venv/
 .env
 .DS_Store
 transcripts/
+voices/*
+!voices/README.md
 *.pyc
 *.pyo

@@ -40,6 +40,7 @@ class BrowserRecordingTests(unittest.TestCase):
         data = component.call_args.kwargs["data"]
         self.assertEqual(data["speech_start_timeout_seconds"], 5)
         self.assertEqual(data["trailing_silence_seconds"], 3)
+        self.assertEqual(data["patient_audio_mime_type"], "audio/mpeg")
 
 
 if __name__ == "__main__":
