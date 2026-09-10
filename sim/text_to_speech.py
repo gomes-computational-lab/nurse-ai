@@ -47,6 +47,14 @@ _TTS_UNAVAILABLE = object()
 _backend: "_SpeechBackend | object | None" = None
 
 
+class TextToSpeechError(RuntimeError):
+    pass
+
+
+class TextToSpeechDependencyError(TextToSpeechError):
+    pass
+
+
 @dataclass(frozen=True)
 class SpeechMetrics:
     status: SpeechStatus
@@ -330,6 +338,42 @@ def speak_text(text: str) -> None:
     stream = create_speech_stream()
     stream.add_chunk(text)
     stream.finish()
+
+
+def synthesize_speech_bytes(text: str) -> bytes:
+    """Synthesize one complete MP3 response for playback by a browser client."""
+    spoken_text = _normalize_speech_text(text)
+    if not spoken_text:
+        return b""
+
+    try:
+        edge_tts_module = importlib.import_module("edge_tts")
+    except ImportError as exc:
+        raise TextToSpeechDependencyError(
+            "Missing text-to-speech dependency `edge-tts`. "
+            "Install requirements with `pip install -r requirements.txt`."
+        ) from exc
+
+    async def collect() -> bytes:
+        communicate = edge_tts_module.Communicate(
+            spoken_text,
+            _TTS_VOICE,
+            rate=_TTS_RATE,
+        )
+        chunks: list[bytes] = []
+        async for chunk in communicate.stream():
+            if chunk.get("type") == "audio":
+                chunks.append(chunk["data"])
+        return b"".join(chunks)
+
+    try:
+        audio = asyncio.run(collect())
+    except Exception as exc:
+        raise TextToSpeechError(f"Could not synthesize patient audio: {exc}") from exc
+
+    if not audio:
+        raise TextToSpeechError("Could not synthesize patient audio: no audio was returned.")
+    return audio
 
 
 def create_speech_stream(

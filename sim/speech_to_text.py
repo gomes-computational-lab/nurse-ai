@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+import tempfile
+from typing import BinaryIO
 
 import numpy as np
 
@@ -48,6 +50,32 @@ def transcribe_audio(audio: Path | np.ndarray, *, model_name: str = DEFAULT_STT_
         return ""
 
     return normalized
+
+
+def transcribe_audio_bytes(
+    audio: bytes | bytearray | BinaryIO,
+    *,
+    model_name: str = DEFAULT_STT_MODEL,
+    suffix: str = ".wav",
+) -> str:
+    """Transcribe uploaded audio without making callers manage a temporary file."""
+    if hasattr(audio, "read"):
+        raw = audio.read()
+    else:
+        raw = bytes(audio)
+
+    if not raw:
+        return ""
+
+    path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
+            temp_file.write(raw)
+            path = Path(temp_file.name)
+        return transcribe_audio(path, model_name=model_name)
+    finally:
+        if path is not None:
+            path.unlink(missing_ok=True)
 
 
 @lru_cache(maxsize=2)

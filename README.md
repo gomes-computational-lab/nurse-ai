@@ -7,6 +7,9 @@ The project uses `main.py` for both terminal paths:
 - `python3 main.py` starts the original typed conversation flow
 - `python3 main.py --voice` starts the local voice flow using microphone input, faster-whisper transcription, Ollama, and spoken patient responses
 
+It also includes `streamlit_app.py`, a browser interface with typed input, browser microphone
+capture, editable transcription, and optional patient audio playback.
+
 ## Requirements
 
 - Python 3.10+
@@ -52,6 +55,29 @@ Run a specific scenario:
 ```bash
 python3 main.py --scenario post_op_pain
 ```
+
+## Run The Browser App
+
+Start Ollama, then launch the Streamlit interface:
+
+```bash
+streamlit run streamlit_app.py
+```
+
+Choose the scenario, Ollama model, Whisper model, and whether patient audio is enabled in
+the sidebar. After starting the simulation, the browser automatically starts recording
+when the patient finishes speaking and stops after five seconds of silence. Recorded
+responses are transcribed into an editable draft; you can also type a response directly.
+Review the text and select **Send response** when it is ready.
+
+The browser will ask for microphone permission on the first turn. Browser capture uses
+the browser's supported Opus audio format for speech recognition. Patient audio is
+synthesized as MP3 with Edge TTS and played by the browser; it requires internet access, and browser autoplay
+policies may require you to press the player's play button. If transcription, Ollama, or
+TTS fails, the page reports the error without crashing the active simulation.
+
+Use **End simulation** to generate feedback and save the result, or **New simulation** to
+clear the current browser session and choose new settings.
 
 ## Run The Voice Demo
 
@@ -134,6 +160,7 @@ The most useful metrics are:
 ```text
 main.py                 Typed and --voice terminal entry point
 voice_demo.py           Backward-compatible voice launcher
+streamlit_app.py        Browser simulation entry point
 sim/
   app.py                Typed terminal app flow
   audio.py              Microphone recording helpers
@@ -145,6 +172,7 @@ sim/
   terminal_ui.py        Shared terminal helpers
   text_to_speech.py     Cross-platform TTS helpers
   voice_app.py          Voice demo flow
+  web_app.py            Streamlit browser flow
 scenarios/
   post_op_pain.json     Sample nursing scenario
 transcripts/            Generated at runtime
