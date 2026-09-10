@@ -157,7 +157,7 @@ def _render_getting_started() -> None:
             "2. **Choose a scenario** and decide whether patient audio should play.\n"
             "3. **Select Start simulation**, then allow microphone access in your browser.\n"
             "4. **Listen to the patient.** Recording begins automatically when the patient finishes.\n"
-            "5. **Speak your response**, then stay quiet for five seconds to stop recording.\n"
+            "5. **Begin speaking within five seconds**, then stay quiet for three seconds when finished.\n"
             "6. **Review the transcription** and select **Send response**."
         )
         st.caption(
@@ -216,13 +216,13 @@ def _render_composer() -> None:
     if patient_audio_enabled:
         st.info(
             "Wait for the patient to finish speaking. Recording starts automatically; "
-            "when you finish your response, remain quiet for five seconds.",
+            "begin within five seconds, then remain quiet for three seconds when finished.",
             icon=":material/mic:",
         )
     else:
         st.info(
             "Recording starts automatically when the patient's text response is ready; "
-            "when you finish your response, remain quiet for five seconds.",
+            "begin within five seconds, then remain quiet for three seconds when finished.",
             icon=":material/mic:",
         )
 
@@ -234,8 +234,9 @@ def _render_composer() -> None:
         st.markdown(
             "- Allow microphone access when prompted.\n"
             "- A pulsing red dot means recording is active.\n"
-            "- Speak naturally; brief pauses shorter than five seconds are okay.\n"
-            "- After five seconds of silence, transcription starts automatically.\n"
+            "- Begin speaking within five seconds after the patient finishes.\n"
+            "- After speech begins, pauses shorter than three seconds are okay.\n"
+            "- Three seconds of silence ends recording and starts transcription automatically.\n"
             "- Edit the transcription if needed, then select **Send response**.\n"
             "- If autoplay is blocked, play the patient audio above and select **Start recording**."
         )

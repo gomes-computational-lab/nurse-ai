@@ -7,7 +7,8 @@ from typing import Any
 import streamlit as st
 
 
-SILENCE_SECONDS = 5
+SPEECH_START_TIMEOUT_SECONDS = 5
+TRAILING_SILENCE_SECONDS = 3
 MAX_RECORDING_SECONDS = 120
 
 
@@ -201,8 +202,11 @@ export default function(component) {
       source.connect(analyser)
       const samples = new Float32Array(analyser.fftSize)
       const silenceThreshold = Number(data.silence_threshold || 0.018)
-      const silenceMs = Number(data.silence_seconds) * 1000
-      let quietSince = performance.now()
+      const speechStartTimeoutMs = Number(data.speech_start_timeout_seconds) * 1000
+      const trailingSilenceMs = Number(data.trailing_silence_seconds) * 1000
+      let recordingStartedAt = null
+      let speechDetected = false
+      let quietSince = null
 
       const detectSilence = now => {
         if (cancelled || !recorder || recorder.state !== "recording") return
@@ -210,24 +214,50 @@ export default function(component) {
         let energy = 0
         for (const sample of samples) energy += sample * sample
         const rms = Math.sqrt(energy / samples.length)
-        if (rms >= silenceThreshold) quietSince = now
-        const quietFor = now - quietSince
-        const secondsLeft = Math.max(0, Math.ceil((silenceMs - quietFor) / 1000))
-        setStatus(
-          "recording",
-          rms >= silenceThreshold
-            ? "Recording…"
-            : `Recording… stopping after ${secondsLeft}s of silence`,
-        )
-        if (quietFor >= silenceMs) {
-          recorder.stop()
-          return
+
+        if (rms >= silenceThreshold) {
+          speechDetected = true
+          quietSince = null
+          setStatus("recording", "Recording…")
+        } else if (!speechDetected) {
+          const waitingFor = now - recordingStartedAt
+          const secondsLeft = Math.max(
+            0,
+            Math.ceil((speechStartTimeoutMs - waitingFor) / 1000),
+          )
+          setStatus(
+            "recording",
+            `Ready—start speaking. Recording stops in ${secondsLeft}s if no speech is detected.`,
+          )
+          if (waitingFor >= speechStartTimeoutMs) {
+            recorder.stop()
+            return
+          }
+        } else {
+          if (quietSince === null) quietSince = now
+          const quietFor = now - quietSince
+          const secondsLeft = Math.max(
+            0,
+            Math.ceil((trailingSilenceMs - quietFor) / 1000),
+          )
+          setStatus(
+            "recording",
+            `Recording… stopping after ${secondsLeft}s of silence.`,
+          )
+          if (quietFor >= trailingSilenceMs) {
+            recorder.stop()
+            return
+          }
         }
         animationFrame = requestAnimationFrame(detectSilence)
       }
 
       recorder.start(250)
-      setStatus("recording", "Recording… stopping after 5s of silence")
+      recordingStartedAt = performance.now()
+      setStatus(
+        "recording",
+        `Ready—start speaking. Recording stops in ${data.speech_start_timeout_seconds}s if no speech is detected.`,
+      )
       animationFrame = requestAnimationFrame(detectSilence)
       maxTimer = setTimeout(() => {
         if (recorder && recorder.state === "recording") recorder.stop()
@@ -311,9 +341,10 @@ def automatic_silence_recorder(
     patient_audio: bytes | None,
     key: str,
     active: bool = True,
-    silence_seconds: int = SILENCE_SECONDS,
+    speech_start_timeout_seconds: int = SPEECH_START_TIMEOUT_SECONDS,
+    trailing_silence_seconds: int = TRAILING_SILENCE_SECONDS,
 ) -> tuple[BrowserRecording | None, str | None]:
-    """Play the patient turn, then capture audio until trailing silence."""
+    """Play the patient turn, wait for speech, then capture until trailing silence."""
     encoded_patient_audio = (
         base64.b64encode(patient_audio).decode("ascii") if patient_audio else None
     )
@@ -323,7 +354,8 @@ def automatic_silence_recorder(
             "turn_id": turn_id,
             "active": active,
             "patient_audio_base64": encoded_patient_audio,
-            "silence_seconds": silence_seconds,
+            "speech_start_timeout_seconds": speech_start_timeout_seconds,
+            "trailing_silence_seconds": trailing_silence_seconds,
             "max_recording_seconds": MAX_RECORDING_SECONDS,
             "silence_threshold": 0.018,
         },

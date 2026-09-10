@@ -95,6 +95,13 @@ class StreamlitAppTests(unittest.TestCase):
                     for item in app.markdown
                 )
             )
+            self.assertTrue(
+                any(
+                    "Begin speaking within five seconds" in item.value
+                    and "Three seconds of silence" in item.value
+                    for item in app.markdown
+                )
+            )
             self.assertIn(
                 "Can you help me with this pain?",
                 [markdown.value for markdown in app.markdown],

@@ -66,8 +66,9 @@ streamlit run streamlit_app.py
 
 Choose the scenario, Ollama model, Whisper model, and whether patient audio is enabled in
 the sidebar. After starting the simulation, the browser automatically starts recording
-when the patient finishes speaking and stops after five seconds of silence. Recorded
-responses are transcribed into an editable draft; you can also type a response directly.
+when the patient finishes speaking. The nurse has five seconds to begin; after speech is
+detected, three seconds of silence stops the recording. Recorded responses are transcribed
+into an editable draft; you can also type a response directly.
 Review the text and select **Send response** when it is ready.
 
 The browser will ask for microphone permission on the first turn. Browser capture uses
