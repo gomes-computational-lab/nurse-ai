@@ -35,6 +35,10 @@ class StubProvider:
 
 
 class ExpressiveTTSTests(unittest.TestCase):
+    def test_invalid_provider_is_rejected_instead_of_routing_to_edge(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Unsupported TTS provider 'typo'"):
+            TTSConfig(provider="typo")  # type: ignore[arg-type]
+
     def test_delivery_mappings_are_bounded_and_clinically_subtle(self) -> None:
         style = DeliveryStyle(emotion="fearful", intensity=3, pace="fast")
 

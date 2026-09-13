@@ -23,6 +23,7 @@ from sim.voice_delivery import DEFAULT_DELIVERY, DeliveryStyle
 
 
 TTSProviderName = Literal["zonos2", "chatterbox_nano", "edge"]
+SUPPORTED_TTS_PROVIDERS = ("zonos2", "chatterbox_nano", "edge")
 DEFAULT_TTS_PROVIDER: TTSProviderName = "zonos2"
 DEFAULT_ZONOS2_URL = "http://localhost:1919"
 DEFAULT_VOICE = "default"
@@ -47,6 +48,13 @@ class TTSConfig:
     voice_catalog_dir: str = "voices"
     allow_online_edge_fallback: bool = False
     timeout_seconds: float = 45.0
+
+    def __post_init__(self) -> None:
+        if self.provider not in SUPPORTED_TTS_PROVIDERS:
+            supported = ", ".join(SUPPORTED_TTS_PROVIDERS)
+            raise ValueError(
+                f"Unsupported TTS provider {self.provider!r}; expected one of: {supported}"
+            )
 
 
 @dataclass(frozen=True)
@@ -198,8 +206,10 @@ class TTSService:
             order: list[TTSProviderName] = ["zonos2", "chatterbox_nano"]
         elif self.config.provider == "chatterbox_nano":
             order = ["chatterbox_nano"]
-        else:
+        elif self.config.provider == "edge":
             order = ["edge"]
+        else:
+            raise LocalTTSError(f"Unsupported TTS provider: {self.config.provider!r}")
         if self.config.allow_online_edge_fallback and "edge" not in order:
             order.append("edge")
         return order
@@ -211,8 +221,10 @@ class TTSService:
                     self._providers[name] = _Zonos2Provider(self.config)
                 elif name == "chatterbox_nano":
                     self._providers[name] = _ChatterboxNanoProvider(self.config)
-                else:
+                elif name == "edge":
                     self._providers[name] = _EdgeProvider()
+                else:
+                    raise LocalTTSError(f"Unsupported TTS provider: {name!r}")
             return self._providers[name]
 
 
