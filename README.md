@@ -121,6 +121,12 @@ python3 main.py --voice --tts-provider zonos2 --zonos2-url http://10.0.0.20:1919
 python3 main.py --voice --tts-provider chatterbox_nano --tts-voice patient-a
 ```
 
+For ZONOS2, the application reads `/tts/speakers` and accepts only voices preloaded in the
+server's approved default-voice directory. The configured voice can match the server speaker
+ID, label, or reference filename stem; `default` selects the first approved server voice.
+The expressive request uses the full `/tts/generate` contract and validates that the response
+is mono float32 PCM before converting it to WAV.
+
 Voice demo behavior:
 
 - wait for the patient audio to finish, then press `Enter` to start speaking

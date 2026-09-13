@@ -6,10 +6,12 @@ import unittest
 from unittest.mock import patch
 
 from sim.expressive_tts import (
+    LocalTTSError,
     LocalTTSUnavailable,
     SynthesizedAudio,
     TTSConfig,
     TTSService,
+    _validate_zonos2_pcm_response,
     chatterbox_delivery_parameters,
     sanitize_chatterbox_cues,
     zonos2_delivery_parameters,
@@ -105,16 +107,20 @@ class ExpressiveTTSTests(unittest.TestCase):
         self.assertEqual(result.provider, "edge")
         self.assertEqual(result.fallback_from, "chatterbox_nano")
 
-    def test_zonos_request_includes_voice_and_delivery_controls(self) -> None:
-        captured = {}
+    def test_zonos_request_uses_full_expressive_contract(self) -> None:
+        captured = []
 
         class Headers:
-            @staticmethod
-            def get(name, default=None):
-                return "44100" if name == "X-Audio-Sample-Rate" else default
+            def __init__(self, values=None):
+                self.values = values or {}
+
+            def get(self, name, default=None):
+                return self.values.get(name, default)
 
         class Response:
-            headers = Headers()
+            def __init__(self, body, headers=None):
+                self.body = body
+                self.headers = Headers(headers)
 
             def __enter__(self):
                 return self
@@ -123,13 +129,42 @@ class ExpressiveTTSTests(unittest.TestCase):
                 return False
 
             def read(self):
-                return b"\x00\x00\x00\x00"
+                return self.body
 
         def urlopen(request, timeout):
-            captured["url"] = request.full_url
-            captured["payload"] = json.loads(request.data)
-            captured["timeout"] = timeout
-            return Response()
+            captured.append(
+                {
+                    "url": request.full_url,
+                    "method": request.get_method(),
+                    "payload": json.loads(request.data) if request.data else None,
+                    "timeout": timeout,
+                }
+            )
+            if request.full_url.endswith("/tts/speakers"):
+                return Response(
+                    json.dumps(
+                        {
+                            "speakers": [
+                                {
+                                    "id": "default_patient_a",
+                                    "label": "Patient A",
+                                    "scope": "default",
+                                    "is_default": True,
+                                    "original_name": "patient-a.wav",
+                                }
+                            ]
+                        }
+                    ).encode()
+                )
+            return Response(
+                b"\x00\x00\x00\x00",
+                {
+                    "Content-Type": "audio/pcm",
+                    "X-Audio-Sample-Rate": "44100",
+                    "X-Audio-Channels": "1",
+                    "X-Audio-Format": "float32",
+                },
+            )
 
         service = TTSService(
             TTSConfig(
@@ -142,10 +177,33 @@ class ExpressiveTTSTests(unittest.TestCase):
                 DeliveryStyle(emotion="anxious", intensity=2, pace="slow"),
             )
 
-        self.assertEqual(captured["url"], "http://127.0.0.1:1919/v1/audio/speech")
-        self.assertEqual(captured["payload"]["voice"], "patient-a")
-        self.assertEqual(captured["payload"]["speed"], 0.92)
+        self.assertEqual(
+            [request["url"] for request in captured],
+            [
+                "http://127.0.0.1:1919/tts/speakers",
+                "http://127.0.0.1:1919/tts/generate",
+            ],
+        )
+        payload = captured[1]["payload"]
+        self.assertEqual(payload["text"], "I feel worried.")
+        self.assertEqual(payload["speaker_embedding_id"], "default_patient_a")
+        self.assertEqual(payload["speed"], 0.92)
+        self.assertFalse(payload["stream"])
+        self.assertNotIn("input", payload)
+        self.assertNotIn("voice", payload)
+        self.assertNotIn("response_format", payload)
         self.assertEqual(result.data[:4], b"RIFF")
+
+    def test_zonos_rejects_audio_that_is_not_documented_float32_pcm(self) -> None:
+        headers = {
+            "content_type": "audio/wav",
+            "sample_rate": "44100",
+            "channels": "1",
+            "format": "float32",
+        }
+
+        with self.assertRaisesRegex(LocalTTSError, "unexpected content type"):
+            _validate_zonos2_pcm_response(b"RIFF", headers)
 
     def test_cancelled_request_never_reaches_a_provider(self) -> None:
         service = TTSService(TTSConfig(provider="chatterbox_nano"))

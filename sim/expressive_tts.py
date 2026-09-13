@@ -234,20 +234,21 @@ class _Zonos2Provider:
     def __init__(self, config: TTSConfig):
         self._url = config.zonos2_url.rstrip("/")
         self._timeout = config.timeout_seconds
+        self._speaker_lock = threading.Lock()
+        self._server_speakers: list[dict[str, object]] | None = None
         _validate_local_or_approved_url(self._url)
 
     def synthesize(self, text, style, voice, cancel_event) -> SynthesizedAudio:
         if cancel_event.is_set():
             raise LocalTTSError("cancelled")
         payload = {
-            "model": "zonos2",
-            "input": text,
-            "voice": voice,
-            "response_format": "pcm",
+            "text": text,
+            "speaker_embedding_id": self._resolve_server_speaker_id(voice),
+            "stream": False,
             **zonos2_delivery_parameters(style),
         }
         request = urllib.request.Request(
-            f"{self._url}/v1/audio/speech",
+            f"{self._url}/tts/generate",
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -255,16 +256,88 @@ class _Zonos2Provider:
         try:
             with urllib.request.urlopen(request, timeout=self._timeout) as response:
                 pcm = response.read()
-                sample_rate = int(response.headers.get("X-Audio-Sample-Rate", "44100"))
+                response_headers = {
+                    "content_type": response.headers.get("Content-Type", ""),
+                    "sample_rate": response.headers.get("X-Audio-Sample-Rate", ""),
+                    "channels": response.headers.get("X-Audio-Channels", ""),
+                    "format": response.headers.get("X-Audio-Format", ""),
+                }
         except (OSError, ValueError, urllib.error.URLError) as exc:
             raise LocalTTSUnavailable(
                 f"university ZONOS2 server unavailable ({exc})"
             ) from exc
-        if not pcm:
-            raise LocalTTSError("ZONOS2 returned no audio")
+        sample_rate = _validate_zonos2_pcm_response(pcm, response_headers)
         return SynthesizedAudio(
             _pcm_f32_to_wav(pcm, sample_rate), "audio/wav", self.name
         )
+
+    def _resolve_server_speaker_id(self, voice: str) -> str:
+        speakers = self._get_server_speakers()
+        if voice == DEFAULT_VOICE:
+            if not speakers:
+                raise LocalTTSUnavailable(
+                    "ZONOS2 has no university-approved default voices installed"
+                )
+            return str(speakers[0]["id"])
+
+        normalized_voice = voice.casefold()
+        matches = []
+        for speaker in speakers:
+            aliases = {
+                str(speaker["id"]).casefold(),
+                str(speaker.get("label", "")).casefold(),
+                Path(str(speaker.get("original_name", ""))).stem.casefold(),
+            }
+            if normalized_voice in aliases:
+                matches.append(str(speaker["id"]))
+
+        unique_matches = list(dict.fromkeys(matches))
+        if len(unique_matches) == 1:
+            return unique_matches[0]
+        if len(unique_matches) > 1:
+            raise LocalTTSUnavailable(
+                f"ZONOS2 voice {voice!r} matches more than one approved server voice"
+            )
+        raise LocalTTSUnavailable(
+            f"approved ZONOS2 voice {voice!r} is not installed on the university server"
+        )
+
+    def _get_server_speakers(self) -> list[dict[str, object]]:
+        with self._speaker_lock:
+            if self._server_speakers is not None:
+                return self._server_speakers
+
+            request = urllib.request.Request(f"{self._url}/tts/speakers", method="GET")
+            try:
+                with urllib.request.urlopen(
+                    request, timeout=min(self._timeout, 3.0)
+                ) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+            except (OSError, ValueError, urllib.error.URLError) as exc:
+                raise LocalTTSUnavailable(
+                    f"could not load approved voices from ZONOS2 ({exc})"
+                ) from exc
+
+            if not isinstance(payload, dict):
+                raise LocalTTSError("ZONOS2 returned an invalid speaker catalog")
+            raw_speakers = payload.get("speakers")
+            if not isinstance(raw_speakers, list):
+                raise LocalTTSError("ZONOS2 returned an invalid speaker catalog")
+
+            approved_speakers = []
+            for speaker in raw_speakers:
+                if not isinstance(speaker, dict) or not isinstance(
+                    speaker.get("id"), str
+                ):
+                    continue
+                if (
+                    speaker.get("scope") == "default"
+                    or speaker.get("is_default") is True
+                ):
+                    approved_speakers.append(speaker)
+
+            self._server_speakers = approved_speakers
+            return approved_speakers
 
     def capability(self) -> ProviderCapability:
         request = urllib.request.Request(f"{self._url}/tts/capabilities", method="GET")
@@ -417,6 +490,35 @@ def _validate_local_or_approved_url(url: str) -> None:
         raise LocalTTSUnavailable(
             "ZONOS2 URL must be localhost, a private IP, a .local host, or listed in TTS_ALLOWED_HOSTS"
         )
+
+
+def _validate_zonos2_pcm_response(pcm: bytes, headers: dict[str, str]) -> int:
+    if not pcm:
+        raise LocalTTSError("ZONOS2 returned no audio")
+
+    content_type = headers["content_type"].partition(";")[0].strip().lower()
+    if content_type != "audio/pcm":
+        raise LocalTTSError(
+            f"ZONOS2 returned unexpected content type {content_type or 'missing'!r}"
+        )
+
+    audio_format = headers["format"].strip().lower()
+    if audio_format not in {"float32", "float32le", "f32le"}:
+        raise LocalTTSError(
+            f"ZONOS2 returned unexpected audio format {audio_format or 'missing'!r}"
+        )
+    if headers["channels"].strip() != "1":
+        raise LocalTTSError("ZONOS2 response must contain mono audio")
+    if len(pcm) % 4:
+        raise LocalTTSError("ZONOS2 returned an incomplete float32 PCM frame")
+
+    try:
+        sample_rate = int(headers["sample_rate"])
+    except ValueError as exc:
+        raise LocalTTSError("ZONOS2 returned an invalid audio sample rate") from exc
+    if sample_rate <= 0:
+        raise LocalTTSError("ZONOS2 returned an invalid audio sample rate")
+    return sample_rate
 
 
 def _pcm_f32_to_wav(pcm: bytes, sample_rate: int) -> bytes:
