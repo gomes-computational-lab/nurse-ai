@@ -73,6 +73,17 @@ class ProviderCapability:
     local: bool
 
 
+@dataclass
+class _ChatterboxRuntime:
+    model: object
+    torchaudio: object
+    inference_lock: threading.Lock
+
+
+_CHATTERBOX_RUNTIME_LOCK = threading.Lock()
+_CHATTERBOX_RUNTIMES: dict[str, _ChatterboxRuntime] = {}
+
+
 class _Provider(Protocol):
     name: TTSProviderName
 
@@ -361,9 +372,6 @@ class _ChatterboxNanoProvider:
 
     def __init__(self, config: TTSConfig):
         self._catalog = list_approved_voices(config.voice_catalog_dir)
-        self._model = None
-        self._torch = None
-        self._torchaudio = None
 
     def synthesize(self, text, style, voice, cancel_event) -> SynthesizedAudio:
         prompt = self._catalog.get(voice)
@@ -371,20 +379,25 @@ class _ChatterboxNanoProvider:
             raise LocalTTSUnavailable(
                 f"approved voice '{voice}' is not installed in the voice catalog"
             )
-        self._load_model()
+        runtime = _get_chatterbox_runtime()
         if cancel_event.is_set():
             raise LocalTTSError("cancelled")
         params = chatterbox_delivery_parameters(style)
         try:
-            audio = self._model.generate(
-                sanitize_chatterbox_cues(text),
-                audio_prompt_path=str(prompt),
-                **params,
-            )
+            with runtime.inference_lock:
+                if cancel_event.is_set():
+                    raise LocalTTSError("cancelled")
+                audio = runtime.model.generate(
+                    sanitize_chatterbox_cues(text),
+                    audio_prompt_path=str(prompt),
+                    **params,
+                )
             with tempfile.NamedTemporaryFile(suffix=".wav") as output:
-                self._torchaudio.save(output.name, audio.cpu(), self._model.sr)
+                runtime.torchaudio.save(output.name, audio.cpu(), runtime.model.sr)
                 output.seek(0)
                 data = output.read()
+        except LocalTTSError:
+            raise
         except Exception as exc:
             raise LocalTTSError(f"Chatterbox Nano failed ({exc})") from exc
         if cancel_event.is_set():
@@ -404,26 +417,36 @@ class _ChatterboxNanoProvider:
             )
         return ProviderCapability(self.name, True, "On-device model available", True)
 
-    def _load_model(self) -> None:
-        if self._model is not None:
-            return
+
+def _get_chatterbox_runtime() -> _ChatterboxRuntime:
+    try:
+        torch = importlib.import_module("torch")
+        torchaudio = importlib.import_module("torchaudio")
+        module = importlib.import_module("chatterbox.tts_turbo")
+    except ImportError as exc:
+        raise LocalTTSUnavailable(
+            "install Chatterbox with `pip install -r requirements-tts.txt`"
+        ) from exc
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    with _CHATTERBOX_RUNTIME_LOCK:
+        existing = _CHATTERBOX_RUNTIMES.get(device)
+        if existing is not None:
+            return existing
         try:
-            self._torch = importlib.import_module("torch")
-            self._torchaudio = importlib.import_module("torchaudio")
-            module = importlib.import_module("chatterbox.tts_turbo")
-        except ImportError as exc:
-            raise LocalTTSUnavailable(
-                "install Chatterbox with `pip install -r requirements-tts.txt`"
-            ) from exc
-        device = "cuda" if self._torch.cuda.is_available() else "cpu"
-        try:
-            self._model = module.ChatterboxTurboTTS.from_pretrained(
-                device=device, nano=True
-            )
+            model = module.ChatterboxTurboTTS.from_pretrained(device=device, nano=True)
         except Exception as exc:
             raise LocalTTSUnavailable(
                 f"could not load Chatterbox Nano ({exc})"
             ) from exc
+
+        runtime = _ChatterboxRuntime(
+            model=model,
+            torchaudio=torchaudio,
+            inference_lock=threading.Lock(),
+        )
+        _CHATTERBOX_RUNTIMES[device] = runtime
+        return runtime
 
 
 class _EdgeProvider:

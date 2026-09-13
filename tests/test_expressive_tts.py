@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import threading
+import time
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
+from sim import expressive_tts
 from sim.expressive_tts import (
     LocalTTSError,
     LocalTTSUnavailable,
@@ -57,6 +61,123 @@ class ExpressiveTTSTests(unittest.TestCase):
         text = sanitize_chatterbox_cues("[laugh] I feel worse [sigh] [SCREAM].")
 
         self.assertEqual(text, "I feel worse [sigh] .")
+
+    def test_chatterbox_model_is_loaded_once_per_device(self) -> None:
+        class FakeCuda:
+            @staticmethod
+            def is_available():
+                return False
+
+        class FakeTorch:
+            cuda = FakeCuda()
+
+        class FakeModelLoader:
+            calls = 0
+
+            @classmethod
+            def from_pretrained(cls, *, device, nano):
+                cls.calls += 1
+                return (device, nano)
+
+        class FakeChatterboxModule:
+            ChatterboxTurboTTS = FakeModelLoader
+
+        modules = {
+            "torch": FakeTorch(),
+            "torchaudio": object(),
+            "chatterbox.tts_turbo": FakeChatterboxModule(),
+        }
+
+        with (
+            patch.dict(expressive_tts._CHATTERBOX_RUNTIMES, {}, clear=True),
+            patch(
+                "sim.expressive_tts.importlib.import_module",
+                side_effect=modules.__getitem__,
+            ),
+        ):
+            first = expressive_tts._get_chatterbox_runtime()
+            second = expressive_tts._get_chatterbox_runtime()
+
+        self.assertIs(first, second)
+        self.assertEqual(FakeModelLoader.calls, 1)
+
+    def test_chatterbox_serializes_inference_across_provider_instances(self) -> None:
+        active = 0
+        maximum_active = 0
+        activity_lock = threading.Lock()
+
+        class FakeAudio:
+            def cpu(self):
+                return self
+
+        class FakeModel:
+            sr = 24000
+
+            def generate(self, text, **params):
+                nonlocal active, maximum_active
+                del text, params
+                with activity_lock:
+                    active += 1
+                    maximum_active = max(maximum_active, active)
+                time.sleep(0.02)
+                with activity_lock:
+                    active -= 1
+                return FakeAudio()
+
+        class FakeTorchaudio:
+            @staticmethod
+            def save(path, audio, sample_rate):
+                del audio, sample_rate
+                Path(path).write_bytes(b"wav")
+
+        runtime = expressive_tts._ChatterboxRuntime(
+            model=FakeModel(),
+            torchaudio=FakeTorchaudio(),
+            inference_lock=threading.Lock(),
+        )
+        failures = []
+        start = threading.Barrier(3)
+
+        with TemporaryDirectory() as catalog_dir:
+            Path(catalog_dir, "patient-a.wav").touch()
+            config = TTSConfig(
+                provider="chatterbox_nano",
+                voice="patient-a",
+                voice_catalog_dir=catalog_dir,
+            )
+            providers = [
+                expressive_tts._ChatterboxNanoProvider(config),
+                expressive_tts._ChatterboxNanoProvider(config),
+            ]
+
+            def synthesize(provider):
+                try:
+                    start.wait()
+                    provider.synthesize(
+                        "Please help me.",
+                        DeliveryStyle(),
+                        "patient-a",
+                        threading.Event(),
+                    )
+                except Exception as exc:  # pragma: no cover - surfaced below
+                    failures.append(exc)
+
+            with patch(
+                "sim.expressive_tts._get_chatterbox_runtime",
+                return_value=runtime,
+            ):
+                workers = [
+                    threading.Thread(target=synthesize, args=(provider,))
+                    for provider in providers
+                ]
+                for worker in workers:
+                    worker.start()
+                start.wait()
+                for worker in workers:
+                    worker.join()
+
+        self.assertEqual(failures, [])
+        self.assertEqual(maximum_active, 1)
 
     def test_local_fallback_order_uses_chatterbox_after_zonos(self) -> None:
         service = TTSService(TTSConfig(provider="zonos2", voice="patient-a"))
