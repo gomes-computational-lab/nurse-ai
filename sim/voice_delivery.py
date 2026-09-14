@@ -20,6 +20,8 @@ Pace = Literal["slow", "normal", "fast"]
 
 DELIVERY_PREFIX = "[[delivery]]"
 DELIVERY_SUFFIX = "[[/delivery]]"
+MAX_DELIVERY_LEADING_CHARS = 64
+MAX_DELIVERY_HEADER_CHARS = 4096
 VALID_EMOTIONS = {
     "neutral",
     "anxious",
@@ -90,6 +92,7 @@ class DeliveryStreamParser:
         self._on_text = on_text
         self._buffer = ""
         self._header_resolved = False
+        self._discarding_oversized_header = False
         self._visible_chunks: list[str] = []
         self.received_input = False
         self.style = DEFAULT_DELIVERY
@@ -103,22 +106,35 @@ class DeliveryStreamParser:
             return
 
         self._buffer += chunk
-        if DELIVERY_PREFIX.startswith(self._buffer):
+        if self._discarding_oversized_header:
+            self._discard_oversized_header()
             return
-        if not self._buffer.startswith(DELIVERY_PREFIX):
+
+        header_start = self._header_start()
+        if header_start is None:
             buffered = self._buffer
             self._buffer = ""
             self._header_resolved = True
             self._emit(buffered)
             return
 
-        end = self._buffer.find(DELIVERY_SUFFIX, len(DELIVERY_PREFIX))
-        if end < 0:
+        candidate = self._buffer[header_start:]
+        if DELIVERY_PREFIX.startswith(candidate):
             return
 
-        header = self._buffer[: end + len(DELIVERY_SUFFIX)]
-        remainder = self._buffer[end + len(DELIVERY_SUFFIX) :]
-        _, self.style = parse_delivery_response(f"{header}\nplaceholder")
+        end = candidate.find(DELIVERY_SUFFIX, len(DELIVERY_PREFIX))
+        if end < 0:
+            if len(candidate) > MAX_DELIVERY_HEADER_CHARS:
+                self._discarding_oversized_header = True
+                self.style = DEFAULT_DELIVERY
+                self._discard_oversized_header()
+            return
+
+        header_end = end + len(DELIVERY_SUFFIX)
+        header = candidate[:header_end]
+        remainder = candidate[header_end:]
+        if len(header) <= MAX_DELIVERY_HEADER_CHARS:
+            _, self.style = parse_delivery_response(f"{header}\nplaceholder")
         self._buffer = ""
         self._header_resolved = True
         if remainder:
@@ -131,6 +147,39 @@ class DeliveryStreamParser:
             self._header_resolved = True
             self._emit(text)
         return "".join(self._visible_chunks).strip(), self.style
+
+    def _header_start(self) -> int | None:
+        """Return the possible header offset, or None once plain text is certain."""
+        leading = 0
+        while leading < len(self._buffer):
+            char = self._buffer[leading]
+            if char != "\ufeff" and not char.isspace():
+                break
+            leading += 1
+            if leading > MAX_DELIVERY_LEADING_CHARS:
+                return None
+
+        candidate = self._buffer[leading:]
+        if not candidate or DELIVERY_PREFIX.startswith(candidate):
+            return leading
+        if candidate.startswith(DELIVERY_PREFIX):
+            return leading
+        return None
+
+    def _discard_oversized_header(self) -> None:
+        """Hide an overlong header while retaining only enough to find its suffix."""
+        end = self._buffer.find(DELIVERY_SUFFIX)
+        if end >= 0:
+            remainder = self._buffer[end + len(DELIVERY_SUFFIX) :]
+            self._buffer = ""
+            self._discarding_oversized_header = False
+            self._header_resolved = True
+            if remainder:
+                self._emit(remainder.lstrip("\r\n"))
+            return
+
+        overlap = len(DELIVERY_SUFFIX) - 1
+        self._buffer = self._buffer[-overlap:]
 
     def _emit(self, text: str) -> None:
         if not text:
