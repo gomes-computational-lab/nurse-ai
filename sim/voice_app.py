@@ -20,7 +20,7 @@ from sim.audio import (
 from sim.evaluator import evaluate_transcript
 from sim.latency import create_latency_report, refresh_latency_summary
 from sim.ollama_client import OllamaClient, OllamaError
-from sim.scenarios import load_scenario
+from sim.scenarios import load_scenario, select_scenario_phase
 from sim.session import SimulationSession
 from sim.speech_to_text import (
     DEFAULT_STT_MODEL,
@@ -30,7 +30,7 @@ from sim.speech_to_text import (
     transcribe_audio,
 )
 from sim.storage import save_result
-from sim.terminal_ui import choose_scenario, print_feedback, print_scenarios
+from sim.terminal_ui import choose_scenario, print_feedback, print_scenario_header, print_scenarios
 from sim.text_to_speech import create_speech_stream, stop_speaking
 
 
@@ -42,6 +42,7 @@ def main() -> None:
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama model to use. Default: {DEFAULT_MODEL}")
     parser.add_argument("--host", default="http://localhost:11434", help="Ollama host URL.")
     parser.add_argument("--scenario", default=None, help="Scenario ID to run.")
+    parser.add_argument("--phase", type=int, default=None, help="Scenario phase to run, when supported.")
     parser.add_argument("--list", action="store_true", help="List available scenarios and exit.")
     parser.add_argument(
         "--stt-model",
@@ -78,6 +79,7 @@ def main() -> None:
 
     try:
         scenario = load_scenario(args.scenario) if args.scenario else choose_scenario()
+        scenario = select_scenario_phase(scenario, args.phase)
     except (FileNotFoundError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1)
@@ -88,8 +90,7 @@ def main() -> None:
     ollama_preload = _start_ollama_preload(client)
     manual_recording = bool(args.manual_stop)
 
-    print(f"\nScenario: {scenario.title}")
-    print(f"Setting: {scenario.setting}")
+    print_scenario_header(scenario)
     if manual_recording:
         print("Press Enter to start recording and Enter again to stop.")
     else:

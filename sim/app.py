@@ -6,10 +6,10 @@ import sys
 
 from sim.evaluator import evaluate_transcript
 from sim.ollama_client import OllamaClient, OllamaError
-from sim.scenarios import load_scenario
+from sim.scenarios import load_scenario, select_scenario_phase
 from sim.session import SimulationSession
 from sim.storage import save_result
-from sim.terminal_ui import choose_scenario, print_feedback, print_scenarios
+from sim.terminal_ui import choose_scenario, print_feedback, print_scenario_header, print_scenarios
 
 
 DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
@@ -20,6 +20,7 @@ def main() -> None:
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama model to use. Default: {DEFAULT_MODEL}")
     parser.add_argument("--host", default="http://localhost:11434", help="Ollama host URL.")
     parser.add_argument("--scenario", default=None, help="Scenario ID to run.")
+    parser.add_argument("--phase", type=int, default=None, help="Scenario phase to run, when supported.")
     parser.add_argument("--list", action="store_true", help="List available scenarios and exit.")
     args = parser.parse_args()
 
@@ -29,6 +30,7 @@ def main() -> None:
 
     try:
         scenario = load_scenario(args.scenario) if args.scenario else choose_scenario()
+        scenario = select_scenario_phase(scenario, args.phase)
     except (FileNotFoundError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1)
@@ -36,8 +38,7 @@ def main() -> None:
     client = OllamaClient(model=args.model, host=args.host)
     session = SimulationSession(scenario, client)
 
-    print(f"\nScenario: {scenario.title}")
-    print(f"Setting: {scenario.setting}")
+    print_scenario_header(scenario)
     print("Type /help for commands.\n")
 
     try:

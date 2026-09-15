@@ -53,6 +53,17 @@ Run a specific scenario:
 python3 main.py --scenario post_op_pain
 ```
 
+## AI Family Member Prototype
+
+Scenarios can configure either a `patient` or `family_member` AI role. The Ruth Lawson prototype provides phase-specific family-member behavior and lightweight emotional-state guidance:
+
+```bash
+python3 main.py --scenario ruth_family_member --phase 1
+python3 main.py --scenario ruth_family_member --phase 2
+```
+
+The prototype uses the existing turn-based text and audio pipeline. Continuous room listening, speaker identification, multi-speaker diarization, interruption handling, and automatic turn-taking are intentionally deferred to a later phase.
+
 ## Run The Voice Demo
 
 ```bash
@@ -147,6 +158,7 @@ sim/
   voice_app.py          Voice demo flow
 scenarios/
   post_op_pain.json     Sample nursing scenario
+  ruth_family_member.json  Two-phase family-member scenario
 transcripts/            Generated at runtime
 ```
 

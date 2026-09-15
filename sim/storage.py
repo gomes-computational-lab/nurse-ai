@@ -22,6 +22,11 @@ def save_result(
     path = TRANSCRIPT_DIR / f"{timestamp}_{scenario.id}.json"
 
     payload = {
+        "metadata": {
+            "agent_role": scenario.agent_role,
+            "scenario_id": scenario.id,
+            "scenario_phase": scenario.scenario_phase,
+        },
         "scenario": {
             "id": scenario.id,
             "title": scenario.title,

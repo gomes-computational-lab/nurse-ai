@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from sim.models import Scenario
 from sim.scenarios import list_scenarios
 
 
@@ -24,6 +25,19 @@ def choose_scenario():
 def print_scenarios() -> None:
     for scenario in list_scenarios():
         print(f"{scenario.id}: {scenario.title}")
+
+
+def print_scenario_header(scenario: Scenario) -> None:
+    print(f"\nScenario: {scenario.title}")
+    print(f"Setting: {scenario.setting}")
+    print(f"AI Role: {scenario.agent_role.replace('_', ' ').title()}")
+    if scenario.character_name:
+        character = scenario.character_name
+        if scenario.relationship and scenario.patient_name:
+            character += f" — {scenario.patient_name}'s {scenario.relationship}"
+        print(f"Character: {character}")
+    if scenario.scenario_phase is not None:
+        print(f"Scenario Phase: {scenario.scenario_phase}")
 
 
 def print_feedback(feedback: dict[str, Any]) -> None:
