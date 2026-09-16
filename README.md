@@ -10,7 +10,7 @@ The project uses `main.py` for both terminal paths:
 ## Requirements
 
 - Python 3.10+
-- Ollama running locally
+- Ollama running locally or reachable through an SSH tunnel
 - At least one chat-capable Ollama model installed
 - Python dependencies from `requirements.txt`
 
@@ -26,6 +26,48 @@ Start Ollama and install a model:
 ollama serve
 ollama pull llama3.1
 ```
+
+## Configuring Ollama
+
+The Ollama model and base URL can be configured with shell environment variables:
+
+```bash
+export OLLAMA_BASE_URL=http://127.0.0.1:11435
+export OLLAMA_MODEL=qwen3:4b
+```
+
+Command-line arguments take precedence over environment variables, which take precedence over the built-in defaults:
+
+```bash
+python3 main.py --host http://127.0.0.1:11435 --model qwen3:14b
+```
+
+The project includes `.env.example` as a template, but it does not parse `.env` files or require an environment-loading dependency. To use a local `.env` file with a compatible shell:
+
+```bash
+cp .env.example .env
+set -a
+source .env
+set +a
+```
+
+To connect from a Mac to Ollama listening on the loopback interface of `stormbreaker`, use local port `11435` so a local Ollama instance can continue using `11434`:
+
+```bash
+ssh -N \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=30 \
+  -L 11435:127.0.0.1:11434 \
+  <username>@stormbreaker
+```
+
+Verify server reachability, model availability, and one minimal inference request:
+
+```bash
+python3 main.py --check-llm
+```
+
+The check reports the configured URL and model, Ollama version, health-check latency, inference latency, and total elapsed time. If the server, tunnel, or configured model is unavailable, it exits with a targeted diagnostic.
 
 If `faster-whisper` does not install cleanly on Python 3.14, use a Python 3.11 or 3.12 virtual environment for the voice demo.
 
@@ -110,7 +152,7 @@ Optional TTS environment variables:
 - `TTS_RATE` defaults to `+0%`
 - `TTS_FIRST_SEGMENT_CHARS` defaults to `64`; lower values start synthesis sooner but can sound less smooth
 
-Microphone capture, end-of-speech detection, transcription, and Ollama generation remain local. Edge TTS synthesis uses the network.
+Microphone capture, end-of-speech detection, and transcription remain local. Ollama generation uses the configured service, which may be local or reached through an SSH tunnel. Edge TTS synthesis uses the network.
 
 Transcripts and feedback are saved in `transcripts/`. Voice results also include recording, endpoint, transcription, first-text, first-audio, completion, and interruption latency metrics.
 
@@ -170,3 +212,17 @@ The important pieces are already separated:
 - `OllamaClient` can be reused by FastAPI
 - scenario JSON files can be loaded by an instructor dashboard
 - evaluator output is JSON-friendly
+
+## Ollama Tests
+
+The normal test suite mocks the Ollama HTTP endpoint and does not require a running server or SSH tunnel:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+An optional integration test can be explicitly enabled after establishing the tunnel and exporting `OLLAMA_BASE_URL` and `OLLAMA_MODEL`:
+
+```bash
+RUN_OLLAMA_INTEGRATION=1 python3 -m unittest discover -s tests -p 'test_ollama_integration.py' -v
+```

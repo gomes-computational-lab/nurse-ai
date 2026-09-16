@@ -11,10 +11,34 @@ VOICE_MAX_TOKENS = 80
 
 
 class SimulationSession:
-    def __init__(self, scenario: Scenario, client: OllamaClient):
+    def __init__(
+        self,
+        scenario: Scenario,
+        client: OllamaClient,
+        *,
+        learner_count: int | None = None,
+    ):
         self.scenario = scenario
         self.client = client
         self.transcript: list[Message] = []
+        selected_count = (
+            scenario.learner_configuration.min_nurses
+            if learner_count is None
+            else learner_count
+        )
+        self.selected_learner_roles = scenario.learner_configuration.roles_for_count(
+            selected_count
+        )
+        self.active_learner_role = self.selected_learner_roles[0]
+
+    def select_learner_role(self, speaker_role: str) -> None:
+        if speaker_role not in self.selected_learner_roles:
+            available = ", ".join(self.selected_learner_roles)
+            raise ValueError(
+                f"Learner role '{speaker_role}' is not active in this session. "
+                f"Active roles: {available}."
+            )
+        self.active_learner_role = speaker_role
 
     def opening(
         self,
@@ -37,12 +61,23 @@ class SimulationSession:
         on_chunk: Callable[[str], None] | None = None,
         *,
         response_mode: ResponseMode = "text",
+        speaker_role: str | None = None,
     ) -> str:
+        selected_speaker = speaker_role or self.active_learner_role
+        if selected_speaker not in self.selected_learner_roles:
+            raise ValueError(f"Learner role '{selected_speaker}' is not active in this session.")
         messages = self._agent_messages(
             student_response=student_response,
+            student_speaker_role=selected_speaker,
             response_mode=response_mode,
         )
-        self.transcript.append(Message(role="student", content=student_response))
+        self.transcript.append(
+            Message(
+                role="student",
+                content=student_response,
+                speaker_role=selected_speaker,
+            )
+        )
         response = self.client.chat(
             messages,
             temperature=0.75,
@@ -60,10 +95,12 @@ class SimulationSession:
         student_response: str,
         *,
         response_mode: ResponseMode = "text",
+        speaker_role: str | None = None,
     ) -> int:
         return self._prompt_char_count(
             self._agent_messages(
                 student_response=student_response,
+                student_speaker_role=speaker_role or self.active_learner_role,
                 response_mode=response_mode,
             )
         )
@@ -72,6 +109,7 @@ class SimulationSession:
         self,
         student_response: str | None = None,
         *,
+        student_speaker_role: str | None = None,
         response_mode: ResponseMode = "text",
     ) -> list[dict[str, str]]:
         system_prompt = self._system_prompt()
@@ -89,12 +127,28 @@ class SimulationSession:
 
         for message in self.transcript:
             if message.role == "student":
-                messages.append({"role": "user", "content": message.content})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": self._learner_message_content(
+                            message.content,
+                            message.speaker_role,
+                        ),
+                    }
+                )
             else:
                 messages.append({"role": "assistant", "content": message.content})
 
         if student_response is not None:
-            messages.append({"role": "user", "content": student_response})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": self._learner_message_content(
+                        student_response,
+                        student_speaker_role,
+                    ),
+                }
+            )
 
         messages.append(
             {
@@ -119,6 +173,9 @@ class SimulationSession:
         role_name = self.scenario.agent_role.replace("_", " ")
         identity = self._identity_context()
         phase_context = self._phase_context()
+        participant_context = self._participant_context()
+        learner_context = self._learner_context()
+        timeline_context = self._simulation_timeline_context()
         role_rules = self._role_rules()
         return f"""
 You are role-playing in a nursing education simulation.
@@ -128,6 +185,10 @@ Display role: {self.scenario.role}
 {identity}
 Setting: {self.scenario.setting}
 {phase_context}
+{timeline_context}
+
+{participant_context}
+{learner_context}
 
 Patient profile:
 {self.scenario.patient_profile}
@@ -167,6 +228,48 @@ If the student says something unsafe, react realistically with concern, confusio
             f"Internal emotional state (tone guidance only; never speak these numeric values): "
             f"{emotional_state}"
         )
+
+    def _participant_context(self) -> str:
+        if not self.scenario.participants:
+            return ""
+        participants = []
+        for participant in self.scenario.participants:
+            label = participant.display_name or participant.id
+            details = [participant.participant_type]
+            if participant.role:
+                details.append(f"role={participant.role}")
+            participants.append(f"- {label}: {', '.join(details)}")
+        return "Participants:\n" + "\n".join(participants)
+
+    def _learner_context(self) -> str:
+        roles = ", ".join(role.replace("_", " ") for role in self.selected_learner_roles)
+        return f"Active student nurse roles for this simulation run: {roles}."
+
+    def _simulation_timeline_context(self) -> str:
+        timeline = self.scenario.simulation_timeline
+        if timeline is None:
+            return ""
+
+        details = []
+        if timeline.simulation_date:
+            details.append(f"Simulation date (the fictional 'today'): {timeline.simulation_date}")
+        if timeline.clinical_day is not None:
+            details.append(f"Clinical day: {timeline.clinical_day}")
+        if timeline.time_of_day:
+            details.append(f"Time of day: {timeline.time_of_day}")
+        rendered = "\n".join(f"- {detail}" for detail in details)
+        return (
+            "Simulation timeline (fictional clinical time; authoritative):\n"
+            f"{rendered}\n"
+            "Interpret today, yesterday, tomorrow, length of stay, and clinical day relative "
+            "to this simulation timeline. Never substitute the host computer's current date."
+        )
+
+    def _learner_message_content(self, content: str, speaker_role: str | None) -> str:
+        if len(self.selected_learner_roles) == 1 or speaker_role is None:
+            return content
+        label = speaker_role.replace("_", " ").title()
+        return f"{label}: {content}"
 
     def _role_rules(self) -> str:
         if self.scenario.agent_role == "family_member":

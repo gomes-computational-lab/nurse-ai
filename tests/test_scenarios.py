@@ -88,11 +88,19 @@ class ScenarioRoleTests(unittest.TestCase):
                 path = save_result(scenario, [])
             payload = json.loads(path.read_text(encoding="utf-8"))
 
-        self.assertEqual(payload["metadata"], {
+        self.assertEqual({key: payload["metadata"][key] for key in (
+            "agent_role", "scenario_id", "scenario_phase"
+        )}, {
             "agent_role": "family_member",
             "scenario_id": "ruth_family_member",
             "scenario_phase": 2,
         })
+        self.assertEqual(payload["metadata"]["learner_configuration"], {
+            "nurse_count": 1,
+            "roles": ["nurse_primary"],
+        })
+        self.assertEqual(payload["metadata"]["simulation_timeline"]["clinical_day"], 7)
+        self.assertIn("execution_saved_at", payload["metadata"])
 
     def test_family_member_is_an_accepted_configured_role(self) -> None:
         configured = Scenario(

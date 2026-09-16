@@ -8,6 +8,43 @@
   "patient_name": "Ruth Lawson",
   "scenario_phase": 1,
   "setting": "A nursing care encounter with Ruth Lawson and her grandchild",
+  "participants": [
+    {
+      "id": "patient_ruth_lawson",
+      "display_name": "Ruth Lawson",
+      "participant_type": "human",
+      "role": "patient"
+    },
+    {
+      "id": "family_member_alex",
+      "display_name": "Alex",
+      "participant_type": "ai",
+      "role": "family_member"
+    },
+    {
+      "id": "student_nurses",
+      "participant_type": "learner",
+      "role": "student_nurse"
+    },
+    {
+      "id": "simulation_facilitator",
+      "participant_type": "human",
+      "role": "facilitator"
+    }
+  ],
+  "learner_configuration": {
+    "min_nurses": 1,
+    "max_nurses": 2,
+    "supported_roles": [
+      "nurse_primary",
+      "nurse_secondary"
+    ]
+  },
+  "simulation_timeline": {
+    "simulation_date": "2025-01-15",
+    "clinical_day": 7,
+    "time_of_day": "morning"
+  },
   "patient_profile": {
     "name": "Ruth Lawson",
     "age": 80,

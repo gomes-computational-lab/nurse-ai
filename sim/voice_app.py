@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import threading
 import time
@@ -19,7 +18,12 @@ from sim.audio import (
 )
 from sim.evaluator import evaluate_transcript
 from sim.latency import create_latency_report, refresh_latency_summary
-from sim.ollama_client import OllamaClient, OllamaError
+from sim.ollama_client import (
+    OllamaClient,
+    OllamaError,
+    configured_base_url,
+    configured_model,
+)
 from sim.scenarios import load_scenario, select_scenario_phase
 from sim.session import SimulationSession
 from sim.speech_to_text import (
@@ -34,13 +38,12 @@ from sim.terminal_ui import choose_scenario, print_feedback, print_scenario_head
 from sim.text_to_speech import create_speech_stream, stop_speaking
 
 
-DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
-
-
 def main() -> None:
+    default_model = configured_model()
+    default_host = configured_base_url()
     parser = argparse.ArgumentParser(description="Terminal voice demo for the nursing simulation app.")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama model to use. Default: {DEFAULT_MODEL}")
-    parser.add_argument("--host", default="http://localhost:11434", help="Ollama host URL.")
+    parser.add_argument("--model", default=default_model, help=f"Ollama model to use. Default: {default_model}")
+    parser.add_argument("--host", default=default_host, help=f"Ollama base URL. Default: {default_host}")
     parser.add_argument("--scenario", default=None, help="Scenario ID to run.")
     parser.add_argument("--phase", type=int, default=None, help="Scenario phase to run, when supported.")
     parser.add_argument("--list", action="store_true", help="List available scenarios and exit.")
@@ -354,6 +357,7 @@ def _start_ollama_preload(client: OllamaClient) -> dict[str, Any]:
 
     def target() -> None:
         try:
+            client.health_check()
             client.warmup()
         except BaseException as exc:
             preload_state["error"] = exc

@@ -4,7 +4,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
-from sim.models import Scenario
+from sim.models import LearnerConfiguration, Participant, Scenario, SimulationTimeline
 
 
 SCENARIO_DIR = Path(__file__).resolve().parent.parent / "scenarios"
@@ -23,7 +23,7 @@ def load_scenario(scenario_id: str, *, phase: int | None = None) -> Scenario:
     with path.open("r", encoding="utf-8") as file:
         data = json.load(file)
 
-    scenario = Scenario(**data)
+    scenario = Scenario(**_typed_scenario_data(data))
     _validate_scenario(scenario)
     return select_scenario_phase(scenario, phase)
 
@@ -39,6 +39,27 @@ def select_scenario_phase(scenario: Scenario, phase: int | None) -> Scenario:
     return replace(scenario, scenario_phase=phase)
 
 
+def _typed_scenario_data(data: dict) -> dict:
+    typed = dict(data)
+    typed["participants"] = tuple(
+        Participant(**participant) for participant in typed.get("participants", [])
+    )
+
+    learner_data = typed.get("learner_configuration")
+    if learner_data is None:
+        typed["learner_configuration"] = LearnerConfiguration()
+    else:
+        learner_data = dict(learner_data)
+        learner_data["supported_roles"] = tuple(learner_data.get("supported_roles", ()))
+        typed["learner_configuration"] = LearnerConfiguration(**learner_data)
+
+    timeline_data = typed.get("simulation_timeline")
+    typed["simulation_timeline"] = (
+        SimulationTimeline(**timeline_data) if timeline_data is not None else None
+    )
+    return typed
+
+
 def _validate_scenario(scenario: Scenario) -> None:
     if scenario.agent_role not in {"patient", "family_member"}:
         raise ValueError(
@@ -48,6 +69,10 @@ def _validate_scenario(scenario: Scenario) -> None:
         raise ValueError(
             f"Scenario '{scenario.id}' does not define its selected phase {scenario.scenario_phase}."
         )
+
+    participant_ids = [participant.id for participant in scenario.participants]
+    if len(participant_ids) != len(set(participant_ids)):
+        raise ValueError(f"Scenario '{scenario.id}' participant ids must be unique.")
 
     for phase_name, phase in scenario.phases.items():
         if not isinstance(phase, dict):
