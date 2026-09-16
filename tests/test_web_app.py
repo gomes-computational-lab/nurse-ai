@@ -60,11 +60,12 @@ class StreamlitAppTests(unittest.TestCase):
             patch("sim.web_app.list_scenarios", return_value=[scenario()]),
             patch("sim.web_app.OllamaClient", return_value=object()),
             patch("sim.web_app.SimulationSession", FakeSession),
+            patch("sim.web_app._preload_local_speech_models", return_value=True),
         )
 
     def test_initial_page_renders_scenario_and_start_control(self) -> None:
         patches = self._patch_dependencies()
-        with patches[0], patches[1], patches[2]:
+        with patches[0], patches[1], patches[2], patches[3]:
             app = AppTest.from_file(str(APP_PATH)).run()
 
         self.assertFalse(app.exception)
@@ -78,6 +79,9 @@ class StreamlitAppTests(unittest.TestCase):
             )
         )
         self.assertIn("Start simulation", [button.label for button in app.button])
+        self.assertIn(
+            "Prepare local speech models", [button.label for button in app.button]
+        )
         self.assertIn("Check voice engine", [button.label for button in app.button])
         self.assertIn(
             "Patient voice engine", [selectbox.label for selectbox in app.selectbox]
@@ -86,7 +90,7 @@ class StreamlitAppTests(unittest.TestCase):
 
     def test_typed_turn_uses_session_and_renders_both_messages(self) -> None:
         patches = self._patch_dependencies()
-        with patches[0], patches[1], patches[2]:
+        with patches[0], patches[1], patches[2], patches[3]:
             app = AppTest.from_file(str(APP_PATH)).run()
             app.toggle[0].set_value(False).run()
             self._button(app, "Start simulation").click().run()
@@ -140,6 +144,7 @@ class StreamlitAppTests(unittest.TestCase):
             patches[0],
             patches[1],
             patches[2],
+            patches[3],
             patch("sim.web_app.evaluate_transcript", return_value=feedback) as evaluate,
             patch(
                 "sim.web_app.save_result",
@@ -149,7 +154,7 @@ class StreamlitAppTests(unittest.TestCase):
             app = AppTest.from_file(str(APP_PATH)).run()
             app.toggle[0].set_value(False).run()
             self._button(app, "Start simulation").click().run()
-            self._button(app, "End simulation").click().run()
+            self._button(app, "End and score simulation").click().run()
 
             self.assertFalse(app.exception)
             self.assertIn("Feedback", [header.value for header in app.header])
@@ -163,6 +168,55 @@ class StreamlitAppTests(unittest.TestCase):
         self.assertFalse(app.exception)
         self.assertIn("Start simulation", [button.label for button in app.button])
         self.assertNotIn("Feedback", [header.value for header in app.header])
+
+    def test_end_without_scoring_saves_transcript_and_skips_evaluation(self) -> None:
+        patches = self._patch_dependencies()
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patch("sim.web_app.evaluate_transcript") as evaluate,
+            patch(
+                "sim.web_app.save_result",
+                return_value=Path("transcripts/browser_test.json"),
+            ) as save,
+        ):
+            app = AppTest.from_file(str(APP_PATH)).run()
+            app.toggle[0].set_value(False).run()
+            self._button(app, "Start simulation").click().run()
+            self._button(app, "End without scoring").click().run()
+
+        self.assertFalse(app.exception)
+        self.assertTrue(
+            any(
+                "Simulation ended without scoring" in message.value
+                for message in app.info
+            )
+        )
+        self.assertNotIn("Feedback", [header.value for header in app.header])
+        evaluate.assert_not_called()
+        save.assert_called_once()
+        self.assertEqual(len(save.call_args.args), 2)
+
+    def test_prepare_loads_local_models_once_before_starting(self) -> None:
+        patches = self._patch_dependencies()
+        with patches[0], patches[1], patches[2], patches[3] as preload:
+            app = AppTest.from_file(str(APP_PATH)).run()
+            self._button(app, "Prepare local speech models").click().run()
+
+            self.assertFalse(app.exception)
+            self.assertTrue(
+                any(
+                    "Whisper and Chatterbox loaded" in item.value
+                    for item in app.sidebar.caption
+                )
+            )
+
+            self._button(app, "Start simulation").click().run()
+
+        self.assertFalse(app.exception)
+        preload.assert_called_once_with(stt_model="tiny.en", include_chatterbox=True)
 
     @staticmethod
     def _button(app: AppTest, label: str):

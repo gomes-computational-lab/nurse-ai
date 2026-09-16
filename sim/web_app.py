@@ -13,10 +13,12 @@ from sim.evaluator import evaluate_transcript
 from sim.expressive_tts import (
     DEFAULT_TTS_PROVIDER,
     DEFAULT_ZONOS2_URL,
+    LocalTTSError,
     SynthesizedAudio,
     TTSConfig,
     TTSService,
     list_approved_voices,
+    preload_chatterbox_model,
 )
 from sim.ollama_client import OllamaClient, OllamaError
 from sim.scenarios import list_scenarios
@@ -24,6 +26,7 @@ from sim.session import SimulationSession
 from sim.speech_to_text import (
     DEFAULT_STT_MODEL,
     SpeechToTextError,
+    preload_speech_to_text_model,
     transcribe_audio_bytes,
 )
 from sim.storage import save_result
@@ -45,9 +48,11 @@ STATE_DEFAULTS: dict[str, Any] = {
     "feedback": None,
     "saved_path": None,
     "simulation_ended": False,
+    "scoring_skipped": False,
     "tts_warning": None,
     "tts_provider_status": None,
     "tts_health_report": None,
+    "prepared_speech_models": None,
 }
 
 
@@ -81,7 +86,14 @@ def main() -> None:
         st.caption(st.session_state.tts_provider_status)
 
     if st.session_state.simulation_ended:
-        _render_feedback()
+        if st.session_state.scoring_skipped:
+            st.info(
+                "Simulation ended without scoring. The transcript was saved, but no "
+                "performance evaluation was generated.",
+                icon=":material/check_circle:",
+            )
+        else:
+            _render_feedback()
         return
 
     _render_composer()
@@ -204,12 +216,26 @@ def _render_sidebar() -> dict[str, Any]:
                 )
 
         if not active:
+            preload_key = _speech_model_preload_key(config)
+            if st.button("Prepare local speech models", width="stretch"):
+                if _ensure_speech_models_ready(config):
+                    st.rerun()
+
+            if st.session_state.prepared_speech_models == preload_key:
+                prepared_models = "Whisper and Chatterbox"
+                if not patient_audio:
+                    prepared_models = "Whisper (patient audio is off)"
+                st.caption(f"Ready: {prepared_models} loaded for this server.")
+
             if st.button("Start simulation", type="primary", width="stretch"):
-                if _start_simulation(config):
+                if _ensure_speech_models_ready(config) and _start_simulation(config):
                     st.rerun()
         else:
-            if st.button("End simulation", type="primary", width="stretch"):
+            if st.button("End and score simulation", type="primary", width="stretch"):
                 if _end_simulation():
+                    st.rerun()
+            if st.button("End without scoring", width="stretch"):
+                if _end_simulation_without_scoring():
                     st.rerun()
             if st.button("New simulation", width="stretch"):
                 _reset_simulation()
@@ -237,10 +263,12 @@ def _render_getting_started() -> None:
             "2. **Choose a scenario** and decide whether patient audio should play.\n"
             "3. **Choose a local voice engine.** ZONOS2 uses the university GPU server; "
             "Chatterbox Nano runs on this computer.\n"
-            "4. **Select Start simulation**, then allow microphone access in your browser.\n"
-            "5. **Listen to the patient.** Recording begins automatically when the patient finishes.\n"
-            "6. **Begin speaking within five seconds**, then stay quiet for three seconds when finished.\n"
-            "7. **Review the transcription** and select **Send response**."
+            "4. **Prepare the local speech models.** This loads Whisper and, when patient audio "
+            "is enabled, Chatterbox once for this app server.\n"
+            "5. **Select Start simulation**, then allow microphone access in your browser.\n"
+            "6. **Listen to the patient.** Recording begins automatically when the patient finishes.\n"
+            "7. **Begin speaking within five seconds**, then stay quiet for three seconds when finished.\n"
+            "8. **Review the transcription** and select **Send response**."
         )
         st.caption(
             "Patient voices are AI-generated. In offline mode, patient text and audio remain on "
@@ -271,6 +299,39 @@ def _start_simulation(config: dict[str, Any]) -> bool:
         _reset_simulation()
         st.error(str(exc))
         return False
+
+
+def _speech_model_preload_key(config: dict[str, Any]) -> tuple[str, bool]:
+    return config["stt_model"], bool(config["patient_audio"])
+
+
+def _ensure_speech_models_ready(config: dict[str, Any]) -> bool:
+    preload_key = _speech_model_preload_key(config)
+    if st.session_state.prepared_speech_models == preload_key:
+        return True
+
+    include_chatterbox = preload_key[1]
+    description = "Whisper and Chatterbox" if include_chatterbox else "Whisper"
+    try:
+        with st.spinner(f"Loading {description} locally..."):
+            _preload_local_speech_models(
+                stt_model=preload_key[0],
+                include_chatterbox=include_chatterbox,
+            )
+    except (SpeechToTextError, LocalTTSError) as exc:
+        st.error(f"Could not prepare local speech models: {exc}")
+        return False
+
+    st.session_state.prepared_speech_models = preload_key
+    return True
+
+
+@st.cache_resource(max_entries=4, show_spinner=False)
+def _preload_local_speech_models(*, stt_model: str, include_chatterbox: bool) -> bool:
+    preload_speech_to_text_model(model_name=stt_model)
+    if include_chatterbox:
+        preload_chatterbox_model()
+    return True
 
 
 def _render_transcript() -> None:
@@ -477,10 +538,28 @@ def _end_simulation() -> bool:
         st.session_state.feedback = feedback
         st.session_state.saved_path = str(path)
         st.session_state.simulation_ended = True
+        st.session_state.scoring_skipped = False
         return True
     except OllamaError as exc:
         st.error(str(exc))
         return False
+
+
+def _end_simulation_without_scoring() -> bool:
+    if st.session_state.simulation_ended:
+        return True
+    session: SimulationSession = st.session_state.simulation_session
+    scenario = st.session_state.simulation_scenario
+    try:
+        path = save_result(scenario, session.transcript)
+    except OSError as exc:
+        st.error(f"Could not save the transcript: {exc}")
+        return False
+    st.session_state.feedback = None
+    st.session_state.saved_path = str(path)
+    st.session_state.simulation_ended = True
+    st.session_state.scoring_skipped = True
+    return True
 
 
 def _render_feedback() -> None:
