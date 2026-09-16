@@ -410,15 +410,44 @@ class _ChatterboxNanoProvider:
                 self.name, False, "No approved reference voices are installed", True
             )
         try:
+            _configure_chatterbox_import_cache()
             importlib.import_module("chatterbox.tts_turbo")
+            _require_perth_watermarker()
         except ImportError:
             return ProviderCapability(
                 self.name, False, "Install optional Chatterbox dependencies", True
             )
+        except Exception as exc:
+            return ProviderCapability(
+                self.name, False, f"Chatterbox import failed: {exc}", True
+            )
         return ProviderCapability(self.name, True, "On-device model available", True)
 
 
+def _configure_chatterbox_import_cache() -> None:
+    if "NUMBA_CACHE_DIR" in os.environ:
+        return
+    cache_dir = Path(tempfile.gettempdir()) / "nursing-ai-sim-numba-cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["NUMBA_CACHE_DIR"] = str(cache_dir)
+
+
+def _require_perth_watermarker() -> None:
+    perth = importlib.import_module("perth")
+    if not callable(getattr(perth, "PerthImplicitWatermarker", None)):
+        raise LocalTTSUnavailable(
+            "resemble-perth 1.1.0 or newer is required; run "
+            "`python -m pip install -r requirements-tts.txt`"
+        )
+
+
+def preload_chatterbox_model() -> None:
+    """Load and retain the local Chatterbox runtime for later synthesis."""
+    _get_chatterbox_runtime()
+
+
 def _get_chatterbox_runtime() -> _ChatterboxRuntime:
+    _configure_chatterbox_import_cache()
     try:
         torch = importlib.import_module("torch")
         torchaudio = importlib.import_module("torchaudio")
@@ -427,6 +456,7 @@ def _get_chatterbox_runtime() -> _ChatterboxRuntime:
         raise LocalTTSUnavailable(
             "install Chatterbox with `pip install -r requirements-tts.txt`"
         ) from exc
+    _require_perth_watermarker()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     with _CHATTERBOX_RUNTIME_LOCK:
@@ -434,7 +464,7 @@ def _get_chatterbox_runtime() -> _ChatterboxRuntime:
         if existing is not None:
             return existing
         try:
-            model = module.ChatterboxTurboTTS.from_pretrained(device=device, nano=True)
+            model = module.ChatterboxTurboTTS.from_pretrained(device=device)
         except Exception as exc:
             raise LocalTTSUnavailable(
                 f"could not load Chatterbox Nano ({exc})"

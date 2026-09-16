@@ -75,17 +75,21 @@ class ExpressiveTTSTests(unittest.TestCase):
             calls = 0
 
             @classmethod
-            def from_pretrained(cls, *, device, nano):
+            def from_pretrained(cls, *, device):
                 cls.calls += 1
-                return (device, nano)
+                return device
 
         class FakeChatterboxModule:
             ChatterboxTurboTTS = FakeModelLoader
+
+        class FakePerth:
+            PerthImplicitWatermarker = object
 
         modules = {
             "torch": FakeTorch(),
             "torchaudio": object(),
             "chatterbox.tts_turbo": FakeChatterboxModule(),
+            "perth": FakePerth(),
         }
 
         with (
@@ -100,6 +104,26 @@ class ExpressiveTTSTests(unittest.TestCase):
 
         self.assertIs(first, second)
         self.assertEqual(FakeModelLoader.calls, 1)
+
+    def test_preload_chatterbox_model_initializes_cached_runtime(self) -> None:
+        with patch("sim.expressive_tts._get_chatterbox_runtime") as get_runtime:
+            expressive_tts.preload_chatterbox_model()
+
+        get_runtime.assert_called_once_with()
+
+    def test_chatterbox_requires_working_perth_watermarker(self) -> None:
+        class BrokenPerth:
+            PerthImplicitWatermarker = None
+
+        with patch(
+            "sim.expressive_tts.importlib.import_module",
+            return_value=BrokenPerth(),
+        ):
+            with self.assertRaisesRegex(
+                expressive_tts.LocalTTSUnavailable,
+                "resemble-perth 1.1.0 or newer",
+            ):
+                expressive_tts._require_perth_watermarker()
 
     def test_chatterbox_serializes_inference_across_provider_instances(self) -> None:
         active = 0

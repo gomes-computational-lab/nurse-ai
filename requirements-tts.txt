@@ -1,3 +1,4 @@
 # Optional local, offline patient speech for laptop installations.
 # Chatterbox code and model weights are MIT licensed.
 chatterbox-tts
+resemble-perth @ git+https://github.com/resemble-ai/Perth.git@ff1c8ac55a976971245cdd53c18d6131ca00d993
