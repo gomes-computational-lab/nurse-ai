@@ -106,6 +106,51 @@ python3 main.py --scenario ruth_family_member --phase 2
 
 The prototype uses the existing turn-based text and audio pipeline. Continuous room listening, speaker identification, multi-speaker diarization, interruption handling, and automatic turn-taking are intentionally deferred to a later phase.
 
+## Participants, Learners, and Simulation Time
+
+Scenario files can optionally distinguish human, AI, learner, and facilitator participants. In the Ruth Lawson scenario:
+
+- Ruth Lawson is the human patient
+- Alex is the AI-controlled family member
+- student nurses are learner participants
+- the simulation technician/facilitator is a human facilitator
+
+Participant types and roles are scenario data. Declaring Ruth as a participant does not make her an AI-controlled agent; `agent_role` continues to identify which participant the LLM portrays.
+
+Scenarios can also define the allowed learner configuration. Ruth supports either one or two student nurses:
+
+```json
+"learner_configuration": {
+  "min_nurses": 1,
+  "max_nurses": 2,
+  "supported_roles": [
+    "nurse_primary",
+    "nurse_secondary"
+  ]
+}
+```
+
+The typed application asks for the number of nurses before starting a scenario that offers a choice. With two nurses, use these commands to select who is entering text:
+
+- `/primary` selects `nurse_primary`
+- `/secondary` selects `nurse_secondary`
+
+The active role appears in the input prompt. Learner transcript messages record the optional `speaker_role`, but no student names or other learner identity information are requested. Voice mode remains a single-speaker workflow and records its learner turns as `nurse_primary`; automatic speaker recognition and diarization are not implemented.
+
+Scenarios may define a fictional clinical timeline independently of the real execution date:
+
+```json
+"simulation_timeline": {
+  "simulation_date": "2025-01-15",
+  "clinical_day": 7,
+  "time_of_day": "morning"
+}
+```
+
+When present, this timeline is authoritative for LLM references to today, yesterday, tomorrow, length of stay, and clinical day. Saved results keep the simulation timeline separate from the real-world `execution_saved_at` timestamp. They also record the selected nurse count and learner roles.
+
+Existing scenario JSON remains compatible. A scenario without these fields defaults to one `nurse_primary`, no explicit participant list, and no fictional timeline.
+
 ## Run The Voice Demo
 
 ```bash
@@ -191,10 +236,12 @@ sim/
   app.py                Typed terminal app flow
   audio.py              Microphone recording helpers
   evaluator.py          Student-response analysis
-  models.py             Shared data structures
+  models.py             Scenarios, participants, learners, timelines, and messages
   ollama_client.py      Local Ollama HTTP client
-  scenarios.py          Scenario loading
+  scenarios.py          Scenario loading, typed conversion, and validation
+  session.py            Per-run learner selection, prompts, and transcript state
   speech_to_text.py     Local transcription helpers
+  storage.py            Transcript, run metadata, and feedback persistence
   terminal_ui.py        Shared terminal helpers
   text_to_speech.py     Cross-platform TTS helpers
   voice_app.py          Voice demo flow
