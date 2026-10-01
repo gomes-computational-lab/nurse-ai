@@ -111,6 +111,120 @@ class ExpressiveTTSTests(unittest.TestCase):
 
         get_runtime.assert_called_once_with()
 
+    def test_preload_chatterbox_model_caches_selected_ruth_voice(self) -> None:
+        runtime = expressive_tts._ChatterboxRuntime(
+            model=object(),
+            torchaudio=object(),
+            inference_lock=threading.Lock(),
+        )
+        prompt = Path("voices/child_female_8yo.wav")
+        with (
+            patch(
+                "sim.expressive_tts._get_chatterbox_runtime",
+                return_value=runtime,
+            ),
+            patch(
+                "sim.expressive_tts.list_approved_voices",
+                return_value={"child_female_8yo": prompt},
+            ),
+            patch("sim.expressive_tts._activate_chatterbox_voice") as activate,
+        ):
+            expressive_tts.preload_chatterbox_model(
+                voice="child_female_8yo",
+                voice_catalog_dir="voices",
+            )
+
+        activate.assert_called_once_with(runtime, prompt, exaggeration=0.35)
+
+    def test_chatterbox_caches_voice_conditioning_until_file_changes(self) -> None:
+        class FakeEmotion:
+            def __init__(self):
+                self.value = None
+
+            def fill_(self, value):
+                self.value = value
+
+        class FakeConditions:
+            def __init__(self):
+                self.t3 = type("T3", (), {"emotion_adv": FakeEmotion()})()
+
+        class FakeAudio:
+            def cpu(self):
+                return self
+
+        class FakeModel:
+            sr = 24000
+
+            def __init__(self):
+                self.conds = None
+                self.prepare_calls = 0
+
+            def prepare_conditionals(self, path, *, exaggeration):
+                del path, exaggeration
+                self.prepare_calls += 1
+                self.conds = FakeConditions()
+
+            def generate(self, text, **params):
+                del text, params
+                return FakeAudio()
+
+        class FakeTorchaudio:
+            @staticmethod
+            def save(path, audio, sample_rate):
+                del audio, sample_rate
+                Path(path).write_bytes(b"wav")
+
+        model = FakeModel()
+        runtime = expressive_tts._ChatterboxRuntime(
+            model=model,
+            torchaudio=FakeTorchaudio(),
+            inference_lock=threading.Lock(),
+        )
+        with TemporaryDirectory() as catalog_dir:
+            prompt = Path(catalog_dir, "child_female_8yo.wav")
+            prompt.write_bytes(b"voice")
+            provider = expressive_tts._ChatterboxNanoProvider(
+                TTSConfig(
+                    provider="chatterbox_nano",
+                    voice="child_female_8yo",
+                    voice_catalog_dir=catalog_dir,
+                )
+            )
+            with patch(
+                "sim.expressive_tts._get_chatterbox_runtime",
+                return_value=runtime,
+            ):
+                provider.synthesize(
+                    "Please help me.",
+                    DeliveryStyle(emotion="neutral", intensity=1),
+                    "child_female_8yo",
+                    threading.Event(),
+                )
+                provider.synthesize(
+                    "I feel scared.",
+                    DeliveryStyle(emotion="fearful", intensity=3),
+                    "child_female_8yo",
+                    threading.Event(),
+                )
+                self.assertEqual(model.prepare_calls, 1)
+
+                prompt.write_bytes(b"updated voice")
+                provider.synthesize(
+                    "I still feel scared.",
+                    DeliveryStyle(emotion="fearful", intensity=3),
+                    "child_female_8yo",
+                    threading.Event(),
+                )
+
+        self.assertEqual(model.prepare_calls, 2)
+        self.assertEqual(len(runtime.voice_conditionings), 1)
+        self.assertEqual(
+            model.conds.t3.emotion_adv.value,
+            expressive_tts.chatterbox_delivery_parameters(
+                DeliveryStyle(emotion="fearful", intensity=3)
+            )["exaggeration"],
+        )
+
     def test_chatterbox_requires_working_perth_watermarker(self) -> None:
         class BrokenPerth:
             PerthImplicitWatermarker = None
@@ -136,6 +250,13 @@ class ExpressiveTTSTests(unittest.TestCase):
 
         class FakeModel:
             sr = 24000
+
+            def __init__(self):
+                self.conds = None
+
+            def prepare_conditionals(self, path, *, exaggeration):
+                del path, exaggeration
+                self.conds = object()
 
             def generate(self, text, **params):
                 nonlocal active, maximum_active
@@ -251,6 +372,45 @@ class ExpressiveTTSTests(unittest.TestCase):
 
         self.assertEqual(result.provider, "edge")
         self.assertEqual(result.fallback_from, "chatterbox_nano")
+
+    def test_structured_metadata_never_reaches_any_tts_provider(self) -> None:
+        for provider_name, mime_type in (
+            ("chatterbox_nano", "audio/wav"),
+            ("zonos2", "audio/wav"),
+            ("edge", "audio/mpeg"),
+        ):
+            provider = StubProvider(
+                provider_name,
+                result=SynthesizedAudio(b"audio", mime_type, provider_name),
+            )
+            service = TTSService(TTSConfig(provider=provider_name))
+            service._providers = {provider_name: provider}
+
+            for text in (
+                "Pain level: 8/10",
+                "Emotion: anxious\nPlease help me.",
+                "Please help me.\nPace: slow",
+                '{"emotion":"anxious"}',
+                "[[delivery]]metadata[[/delivery]] Please help me.",
+            ):
+                with self.subTest(provider=provider_name, text=text):
+                    with self.assertRaisesRegex(LocalTTSError, "internal metadata"):
+                        service.synthesize(text)
+
+            self.assertEqual(provider.calls, [])
+
+    def test_natural_pain_wording_reaches_tts_provider(self) -> None:
+        service = TTSService(TTSConfig(provider="chatterbox_nano"))
+        provider = StubProvider(
+            "chatterbox_nano",
+            result=SynthesizedAudio(b"wav", "audio/wav", "chatterbox_nano"),
+        )
+        service._providers = {"chatterbox_nano": provider}
+
+        result = service.synthesize("My pain is 8 out of 10.")
+
+        self.assertEqual(result.provider, "chatterbox_nano")
+        self.assertEqual(provider.calls[0][0], "My pain is 8 out of 10.")
 
     def test_zonos_request_uses_full_expressive_contract(self) -> None:
         captured = []

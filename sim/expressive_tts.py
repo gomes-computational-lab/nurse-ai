@@ -13,13 +13,18 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Protocol
 
 import numpy as np
 
-from sim.voice_delivery import DEFAULT_DELIVERY, DeliveryStyle
+from sim.voice_delivery import (
+    DEFAULT_DELIVERY,
+    DeliveryStyle,
+    UnsafeVoiceResponseError,
+    validate_spoken_text,
+)
 
 
 TTSProviderName = Literal["zonos2", "chatterbox_nano", "edge"]
@@ -78,6 +83,9 @@ class _ChatterboxRuntime:
     model: object
     torchaudio: object
     inference_lock: threading.Lock
+    voice_conditionings: dict[tuple[str, int, int], object] = field(
+        default_factory=dict
+    )
 
 
 _CHATTERBOX_RUNTIME_LOCK = threading.Lock()
@@ -171,9 +179,15 @@ class TTSService:
         style: DeliveryStyle | None = None,
         cancel_event: threading.Event | None = None,
     ) -> SynthesizedAudio:
-        clean_text = " ".join(text.split())
-        if not clean_text:
+        if not text.strip():
             raise LocalTTSError("Patient speech was empty.")
+        try:
+            safe_text = validate_spoken_text(text)
+        except UnsafeVoiceResponseError as exc:
+            raise LocalTTSError(
+                "Patient speech contained internal metadata and was not synthesized."
+            ) from exc
+        clean_text = " ".join(safe_text.split())
         style = style or DEFAULT_DELIVERY
         cancel_event = cancel_event or threading.Event()
         attempted: list[str] = []
@@ -387,9 +401,13 @@ class _ChatterboxNanoProvider:
             with runtime.inference_lock:
                 if cancel_event.is_set():
                     raise LocalTTSError("cancelled")
+                _activate_chatterbox_voice(
+                    runtime,
+                    prompt,
+                    exaggeration=params["exaggeration"],
+                )
                 audio = runtime.model.generate(
                     sanitize_chatterbox_cues(text),
-                    audio_prompt_path=str(prompt),
                     **params,
                 )
             with tempfile.NamedTemporaryFile(suffix=".wav") as output:
@@ -441,9 +459,79 @@ def _require_perth_watermarker() -> None:
         )
 
 
-def preload_chatterbox_model() -> None:
-    """Load and retain the local Chatterbox runtime for later synthesis."""
+def preload_chatterbox_model(
+    *,
+    voice: str = DEFAULT_VOICE,
+    voice_catalog_dir: str | Path = "voices",
+) -> None:
+    """Load Chatterbox and cache the selected approved voice when available."""
+    preload_chatterbox_runtime()
+    if voice == DEFAULT_VOICE:
+        return
+    prepare_chatterbox_voice(voice=voice, voice_catalog_dir=voice_catalog_dir)
+
+
+def preload_chatterbox_runtime() -> None:
+    """Load and retain the shared Chatterbox runtime."""
     _get_chatterbox_runtime()
+
+
+def prepare_chatterbox_voice(
+    *,
+    voice: str = DEFAULT_VOICE,
+    voice_catalog_dir: str | Path = "voices",
+) -> None:
+    """Prepare and retain the conditioning for one approved patient voice."""
+    runtime = _get_chatterbox_runtime()
+    if voice == DEFAULT_VOICE:
+        return
+
+    prompt = list_approved_voices(voice_catalog_dir).get(voice)
+    if prompt is None:
+        raise LocalTTSUnavailable(
+            f"approved voice '{voice}' is not installed in the voice catalog"
+        )
+    exaggeration = chatterbox_delivery_parameters(DEFAULT_DELIVERY)["exaggeration"]
+    with runtime.inference_lock:
+        _activate_chatterbox_voice(runtime, prompt, exaggeration=exaggeration)
+
+
+def _activate_chatterbox_voice(
+    runtime: _ChatterboxRuntime,
+    prompt: Path,
+    *,
+    exaggeration: float,
+) -> None:
+    """Select cached voice conditioning; caller must hold the inference lock."""
+    resolved_prompt = prompt.resolve()
+    stat = resolved_prompt.stat()
+    cache_key = (str(resolved_prompt), stat.st_mtime_ns, stat.st_size)
+    conditionals = runtime.voice_conditionings.get(cache_key)
+
+    if conditionals is None:
+        runtime.model.prepare_conditionals(
+            str(resolved_prompt),
+            exaggeration=exaggeration,
+        )
+        conditionals = getattr(runtime.model, "conds", None)
+        if conditionals is None:
+            raise LocalTTSUnavailable(
+                f"Chatterbox did not prepare approved voice '{prompt.stem}'"
+            )
+        prompt_key = str(resolved_prompt)
+        runtime.voice_conditionings = {
+            key: value
+            for key, value in runtime.voice_conditionings.items()
+            if key[0] != prompt_key
+        }
+        runtime.voice_conditionings[cache_key] = conditionals
+    else:
+        runtime.model.conds = conditionals
+
+    emotion = getattr(getattr(conditionals, "t3", None), "emotion_adv", None)
+    fill_emotion = getattr(emotion, "fill_", None)
+    if callable(fill_emotion):
+        fill_emotion(exaggeration)
 
 
 def _get_chatterbox_runtime() -> _ChatterboxRuntime:

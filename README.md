@@ -36,8 +36,7 @@ If `faster-whisper` does not install cleanly on Python 3.14, use a Python 3.11 o
 
 Patient speech is local-first and uses only permissively licensed components:
 
-- **ZONOS2 (MIT)** is the preferred university GPU option. Run its server on a university-controlled Linux/NVIDIA host and set `ZONOS2_URL` to that private address. For a non-private hostname, add it to the comma-separated `TTS_ALLOWED_HOSTS` environment variable.
-- **Chatterbox Nano (MIT)** is the laptop fallback. Install it separately because its PyTorch dependencies are large:
+- **Chatterbox Nano (MIT)** is the current patient-voice engine. It runs on the local machine hosting Streamlit. Install it separately because its PyTorch dependencies are large:
 
 ```bash
 python3 -m pip install -r requirements-tts.txt
@@ -46,7 +45,44 @@ python3 -m pip install -r requirements-tts.txt
 Chatterbox downloads its model during first setup and can run offline afterward. Add only licensed or explicitly consented reference recordings to `voices/`; the filename becomes the selectable voice ID. No reference recordings are committed with this project.
 Use Python 3.11 for the optional Chatterbox environment, matching the upstream project's tested configuration.
 
-The legacy Edge provider remains available for compatibility, but it is online. It is never an automatic fallback unless the user explicitly enables **Allow online Edge fallback** or passes `--allow-online-edge-fallback`.
+#### Cross-platform local installation
+
+“Local machine” means the Windows, Linux, or macOS computer running Streamlit. Create the
+same Python 3.11 Conda environment on any supported platform:
+
+```bash
+conda create -n nursing-ai-sim python=3.11 -y
+conda activate nursing-ai-sim
+python -m pip install -r requirements.txt
+python -m pip install -r requirements-tts.txt
+```
+
+FFmpeg is only required to generate or convert reference voices. Install it using the option
+for the local operating system:
+
+| Platform | Command |
+| --- | --- |
+| macOS with Homebrew | `brew install ffmpeg` |
+| Ubuntu or Debian | `sudo apt update && sudo apt install ffmpeg` |
+| Windows PowerShell with WinGet | `winget install --id Gyan.FFmpeg -e` |
+| Any platform with Conda | `conda install -n nursing-ai-sim -c conda-forge ffmpeg` |
+
+After installation, verify the active environment before launching the app:
+
+```bash
+python --version
+ffmpeg -version
+python -c "import chatterbox, faster_whisper, streamlit, torch; print('Local speech dependencies are ready')"
+streamlit run streamlit_app.py
+```
+
+All project paths are repository-relative. Run these commands from the project root; no
+macOS-specific `/Users/...` path is required.
+
+The browser interface always uses Chatterbox Nano with online fallback disabled. The ZONOS2
+backend is retained only for a possible future university deployment and is not shown in the
+browser interface. The legacy Edge provider remains available to terminal tools for compatibility,
+but it is online and is never an automatic fallback.
 
 ## Run The Text Simulation
 
@@ -80,8 +116,12 @@ Start Ollama, then launch the Streamlit interface:
 streamlit run streamlit_app.py
 ```
 
-Choose the scenario, Ollama model, Whisper model, local patient voice engine, approved voice,
-and whether patient audio is enabled in the sidebar. After starting the simulation, the browser automatically starts recording
+Choose the scenario, whether the patient should speak aloud, and an approved patient voice in
+the sidebar. Ruth's child voice and Chatterbox Nano are selected automatically. Ollama,
+transcription, local addresses, and voice-engine settings are managed internally and are not
+shown to learners. Use **Load voice and recording** to prepare transcription, the patient voice
+model, and Ruth's voice before starting. After starting the simulation, the browser automatically
+starts recording
 when the patient finishes speaking. The nurse has five seconds to begin; after speech is
 detected, three seconds of silence stops the recording. Recorded responses are transcribed
 into an editable draft; you can also type a response directly.
@@ -93,8 +133,9 @@ synthesized as WAV and played by the browser. Browser autoplay policies may requ
 press the player's play button. If transcription, Ollama, or
 TTS fails, the page reports the error without crashing the active simulation.
 
-Use **End simulation** to generate feedback and save the result, or **New simulation** to
-clear the current browser session and choose new settings.
+Use **End and score simulation** to generate feedback and save the result, **End without
+scoring** to save only the transcript, or **New simulation** to clear the current browser
+session and choose new settings.
 
 ## Run The Voice Demo
 

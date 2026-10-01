@@ -11,14 +11,14 @@ from sim.browser_recorder import (
 )
 from sim.evaluator import evaluate_transcript
 from sim.expressive_tts import (
-    DEFAULT_TTS_PROVIDER,
     DEFAULT_ZONOS2_URL,
     LocalTTSError,
     SynthesizedAudio,
     TTSConfig,
     TTSService,
     list_approved_voices,
-    preload_chatterbox_model,
+    preload_chatterbox_runtime,
+    prepare_chatterbox_voice,
 )
 from sim.ollama_client import OllamaClient, OllamaError
 from sim.scenarios import list_scenarios
@@ -35,6 +35,7 @@ from sim.text_to_speech import TextToSpeechError, synthesize_patient_audio
 
 DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
 DEFAULT_HOST = "http://localhost:11434"
+DEFAULT_PATIENT_VOICE = "child_female_8yo"
 STATE_DEFAULTS: dict[str, Any] = {
     "simulation_session": None,
     "simulation_client": None,
@@ -51,7 +52,6 @@ STATE_DEFAULTS: dict[str, Any] = {
     "scoring_skipped": False,
     "tts_warning": None,
     "tts_provider_status": None,
-    "tts_health_report": None,
     "prepared_speech_models": None,
 }
 
@@ -113,121 +113,87 @@ def _render_sidebar() -> dict[str, Any]:
 
     active = st.session_state.simulation_session is not None
     with st.sidebar:
-        st.header("Simulation setup")
+        st.header("Start a simulation")
         scenario = st.selectbox(
             "Scenario",
             scenarios,
             format_func=lambda item: item.title,
             disabled=active,
         )
-        model = st.text_input("Ollama model", value=DEFAULT_MODEL, disabled=active)
-        host = st.text_input("Ollama host", value=DEFAULT_HOST, disabled=active)
-        stt_model = st.text_input(
-            "Whisper model",
-            value=DEFAULT_STT_MODEL,
+        patient_audio = st.toggle(
+            "Patient speaks aloud",
+            value=True,
             disabled=active,
-        )
-        patient_audio = st.toggle("Patient browser audio", value=True, disabled=active)
-        provider_labels = {
-            "zonos2": "ZONOS2 — university GPU",
-            "chatterbox_nano": "Chatterbox Nano — this computer",
-            "edge": "Legacy Edge — online",
-        }
-        provider = st.selectbox(
-            "Patient voice engine",
-            tuple(provider_labels),
-            index=tuple(provider_labels).index(
-                os.environ.get("LOCAL_TTS_PROVIDER", DEFAULT_TTS_PROVIDER)
-            )
-            if os.environ.get("LOCAL_TTS_PROVIDER", DEFAULT_TTS_PROVIDER)
-            in provider_labels
-            else 0,
-            format_func=provider_labels.get,
-            disabled=active,
+            help="Turn this off to use text-only patient responses.",
         )
         catalog_dir = os.environ.get("TTS_VOICE_CATALOG", "voices")
-        voices = ["default", *list_approved_voices(catalog_dir)]
-        voice = st.selectbox(
-            "Approved patient voice",
-            voices,
-            disabled=active,
-            help="Add only licensed or consented recordings to the local voices directory.",
-        )
-        zonos2_url = st.text_input(
-            "University ZONOS2 URL",
-            value=os.environ.get("ZONOS2_URL", DEFAULT_ZONOS2_URL),
-            disabled=active,
-        )
-        allow_edge_fallback = st.toggle(
-            "Allow online Edge fallback",
-            value=False,
-            disabled=active or provider == "edge",
-            help="Off by default. Enabling this may send generated patient text outside the university.",
-        )
-        if provider == "edge" or allow_edge_fallback:
-            st.warning(
-                "Legacy Edge TTS is online and does not meet offline-only privacy mode."
+        approved_voices = list_approved_voices(catalog_dir)
+        voice_options = [
+            DEFAULT_PATIENT_VOICE,
+            *(voice for voice in approved_voices if voice != DEFAULT_PATIENT_VOICE),
+        ]
+        voice = DEFAULT_PATIENT_VOICE
+        if patient_audio:
+            voice = st.selectbox(
+                "Patient voice",
+                voice_options,
+                format_func=_format_voice_name,
+                disabled=active,
+                help="Only approved voices stored on this computer are available.",
             )
 
-        with st.expander("Setup help", icon=":material/help:"):
-            st.markdown(
-                "1. Start Ollama on this computer.\n"
-                "2. Confirm the selected Ollama model is installed.\n"
-                "3. Keep the default host unless Ollama runs elsewhere.\n"
-                "4. Choose the university ZONOS2 server or install Chatterbox Nano locally.\n"
-                "5. Allow microphone access when the browser asks."
+        voice_ready = voice in approved_voices
+        if patient_audio and not voice_ready:
+            st.warning(
+                "Ruth's voice is not installed on this computer. Ask the simulation "
+                "administrator to complete the local voice setup, or turn off patient speech."
             )
-            st.code("ollama serve\nollama pull llama3.1", language="bash")
-            st.caption(
-                "Local voice models are downloaded once during setup and run offline afterward. "
-                "Add university DNS names to `TTS_ALLOWED_HOSTS`. Microphone capture works on "
-                "localhost or a secure HTTPS connection."
+
+        with st.expander("Before you begin", icon=":material/help:"):
+            st.markdown(
+                "1. Choose a scenario.\n"
+                "2. Leave **Patient speaks aloud** on to hear Ruth.\n"
+                "3. Select **Load voice and recording**.\n"
+                "4. Select **Start simulation** and allow microphone access when asked."
             )
 
         config = {
             "scenario": scenario,
-            "model": model.strip(),
-            "host": host.strip(),
-            "stt_model": stt_model.strip(),
+            "model": DEFAULT_MODEL,
+            "host": DEFAULT_HOST,
+            "stt_model": DEFAULT_STT_MODEL,
             "patient_audio": patient_audio,
-            "tts_provider": provider,
+            "tts_provider": "chatterbox_nano",
             "tts_voice": voice,
-            "zonos2_url": zonos2_url.strip(),
+            "zonos2_url": DEFAULT_ZONOS2_URL,
             "voice_catalog_dir": catalog_dir,
-            "allow_online_edge_fallback": allow_edge_fallback,
+            "allow_online_edge_fallback": False,
         }
-
-        if not active and st.button("Check voice engine", width="stretch"):
-            service = _get_tts_service(
-                provider,
-                voice,
-                zonos2_url.strip(),
-                catalog_dir,
-                allow_edge_fallback,
-            )
-            st.session_state.tts_health_report = service.capabilities()
-
-        if not active and st.session_state.tts_health_report:
-            for capability in st.session_state.tts_health_report:
-                status = "Available" if capability.available else "Unavailable"
-                locality = "local" if capability.local else "online"
-                st.caption(
-                    f"{capability.provider}: {status} ({locality}) — {capability.detail}"
-                )
 
         if not active:
             preload_key = _speech_model_preload_key(config)
-            if st.button("Prepare local speech models", width="stretch"):
+            speech_ready = st.session_state.prepared_speech_models == preload_key
+            if st.button(
+                "Load voice and recording",
+                width="stretch",
+                disabled=speech_ready or (patient_audio and not voice_ready),
+                help=(
+                    "Loads transcription and the local patient voice before the simulation starts."
+                    if patient_audio
+                    else "Loads transcription before the simulation starts."
+                ),
+            ):
                 if _ensure_speech_models_ready(config):
                     st.rerun()
+            if speech_ready:
+                st.caption(":green[●] Voice and recording ready")
 
-            if st.session_state.prepared_speech_models == preload_key:
-                prepared_models = "Whisper and Chatterbox"
-                if not patient_audio:
-                    prepared_models = "Whisper (patient audio is off)"
-                st.caption(f"Ready: {prepared_models} loaded for this server.")
-
-            if st.button("Start simulation", type="primary", width="stretch"):
+            if st.button(
+                "Start simulation",
+                type="primary",
+                width="stretch",
+                disabled=patient_audio and not voice_ready,
+            ):
                 if _ensure_speech_models_ready(config) and _start_simulation(config):
                     st.rerun()
         else:
@@ -257,23 +223,22 @@ def _render_scenario_preview(scenario) -> None:
 
 def _render_getting_started() -> None:
     with st.container(border=True):
-        st.subheader("Set up voice practice")
+        st.subheader("How it works")
         st.markdown(
-            "1. **Start Ollama** and make sure the model selected in the sidebar is available.\n"
-            "2. **Choose a scenario** and decide whether patient audio should play.\n"
-            "3. **Choose a local voice engine.** ZONOS2 uses the university GPU server; "
-            "Chatterbox Nano runs on this computer.\n"
-            "4. **Prepare the local speech models.** This loads Whisper and, when patient audio "
-            "is enabled, Chatterbox once for this app server.\n"
-            "5. **Select Start simulation**, then allow microphone access in your browser.\n"
-            "6. **Listen to the patient.** Recording begins automatically when the patient finishes.\n"
-            "7. **Begin speaking within five seconds**, then stay quiet for three seconds when finished.\n"
-            "8. **Review the transcription** and select **Send response**."
+            "1. **Choose a scenario** and select **Start simulation**.\n"
+            "2. **Listen to Ruth.** Recording begins automatically when she finishes.\n"
+            "3. **Begin speaking within five seconds.** When you finish, stay quiet for three seconds.\n"
+            "4. **Review your response** and select **Send response**."
         )
         st.caption(
-            "Patient voices are AI-generated. In offline mode, patient text and audio remain on "
-            "the university server or this computer. You can always type or edit your response."
+            "Ruth's voice is AI-generated and runs locally. You can always type or edit your response."
         )
+
+
+def _format_voice_name(voice: str) -> str:
+    if voice == DEFAULT_PATIENT_VOICE:
+        return "Ruth — child voice"
+    return voice.replace("_", " ").replace("-", " ").title()
 
 
 def _start_simulation(config: dict[str, Any]) -> bool:
@@ -301,8 +266,13 @@ def _start_simulation(config: dict[str, Any]) -> bool:
         return False
 
 
-def _speech_model_preload_key(config: dict[str, Any]) -> tuple[str, bool]:
-    return config["stt_model"], bool(config["patient_audio"])
+def _speech_model_preload_key(
+    config: dict[str, Any],
+) -> tuple[str, bool, str, str]:
+    include_chatterbox = bool(config["patient_audio"])
+    voice = config["tts_voice"] if include_chatterbox else ""
+    catalog_dir = config["voice_catalog_dir"] if include_chatterbox else ""
+    return config["stt_model"], include_chatterbox, voice, catalog_dir
 
 
 def _ensure_speech_models_ready(config: dict[str, Any]) -> bool:
@@ -310,27 +280,67 @@ def _ensure_speech_models_ready(config: dict[str, Any]) -> bool:
     if st.session_state.prepared_speech_models == preload_key:
         return True
 
-    include_chatterbox = preload_key[1]
-    description = "Whisper and Chatterbox" if include_chatterbox else "Whisper"
+    stt_model, include_chatterbox, voice, catalog_dir = preload_key
+    description = "voice and recording" if include_chatterbox else "recording"
+    progress = st.status(f"Getting {description} ready...", expanded=True)
     try:
-        with st.spinner(f"Loading {description} locally..."):
-            _preload_local_speech_models(
-                stt_model=preload_key[0],
-                include_chatterbox=include_chatterbox,
-            )
+        _preload_local_speech_models(
+            stt_model=stt_model,
+            include_chatterbox=include_chatterbox,
+            chatterbox_voice=voice,
+            voice_catalog_dir=catalog_dir,
+            _on_stage=progress.write,
+        )
     except (SpeechToTextError, LocalTTSError) as exc:
-        st.error(f"Could not prepare local speech models: {exc}")
+        progress.update(
+            label=f"Could not prepare {description}", state="error", expanded=True
+        )
+        st.error(f"Could not prepare the simulation: {exc}")
         return False
 
+    progress.write("Ready")
+    progress.update(
+        label=f"{description.capitalize()} ready", state="complete", expanded=False
+    )
     st.session_state.prepared_speech_models = preload_key
     return True
 
 
-@st.cache_resource(max_entries=4, show_spinner=False)
-def _preload_local_speech_models(*, stt_model: str, include_chatterbox: bool) -> bool:
-    preload_speech_to_text_model(model_name=stt_model)
+def _preload_local_speech_models(
+    *,
+    stt_model: str,
+    include_chatterbox: bool,
+    chatterbox_voice: str,
+    voice_catalog_dir: str,
+    _on_stage: Callable[[str], None] | None = None,
+) -> bool:
+    report = _on_stage or (lambda stage: None)
+    report("Loading transcription model")
+    _preload_speech_to_text_resource(stt_model)
     if include_chatterbox:
-        preload_chatterbox_model()
+        report("Loading patient voice")
+        _preload_chatterbox_runtime_resource()
+        voice_name = _format_voice_name(chatterbox_voice).split(" — ", 1)[0]
+        report(f"Preparing {voice_name}’s voice")
+        _prepare_chatterbox_voice_resource(chatterbox_voice, voice_catalog_dir)
+    return True
+
+
+@st.cache_resource(max_entries=2, show_spinner=False)
+def _preload_speech_to_text_resource(model_name: str) -> bool:
+    preload_speech_to_text_model(model_name=model_name)
+    return True
+
+
+@st.cache_resource(max_entries=1, show_spinner=False)
+def _preload_chatterbox_runtime_resource() -> bool:
+    preload_chatterbox_runtime()
+    return True
+
+
+@st.cache_resource(max_entries=8, show_spinner=False)
+def _prepare_chatterbox_voice_resource(voice: str, voice_catalog_dir: str) -> bool:
+    prepare_chatterbox_voice(voice=voice, voice_catalog_dir=voice_catalog_dir)
     return True
 
 
@@ -428,12 +438,12 @@ def _render_composer() -> None:
         placeholder="Your recording is transcribed here automatically, or you can type a response.",
     )
     if st.button("Send response", type="primary", disabled=not draft.strip()):
-        _submit_student_response(draft.strip())
-        st.session_state.draft_text = ""
-        st.session_state.composer_version += 1
-        st.session_state.recorder_version += 1
-        st.session_state.processed_recording_turn = None
-        st.rerun()
+        if _submit_student_response(draft.strip()):
+            st.session_state.draft_text = ""
+            st.session_state.composer_version += 1
+            st.session_state.recorder_version += 1
+            st.session_state.processed_recording_turn = None
+            st.rerun()
 
 
 def _render_record_again(turn_id: str) -> None:
@@ -443,7 +453,7 @@ def _render_record_again(turn_id: str) -> None:
         st.rerun()
 
 
-def _submit_student_response(student_text: str) -> None:
+def _submit_student_response(student_text: str) -> bool:
     session: SimulationSession = st.session_state.simulation_session
     try:
         with st.spinner("Patient is responding..."):
@@ -455,8 +465,11 @@ def _submit_student_response(student_text: str) -> None:
                 )
             )
         _add_patient_audio(len(session.transcript) - 1, response)
+        return True
     except OllamaError as exc:
+        st.session_state.draft_text = student_text
         st.error(str(exc))
+        return False
 
 
 def _stream_patient_response(
@@ -469,7 +482,11 @@ def _stream_patient_response(
         chunks.append(chunk)
         placeholder.markdown("".join(chunks) + " ▌")
 
-    response = generate(on_chunk)
+    try:
+        response = generate(on_chunk)
+    except Exception:
+        placeholder.empty()
+        raise
     placeholder.markdown(response)
     return response
 
@@ -496,12 +513,10 @@ def _add_patient_audio(message_index: int, response: str) -> None:
         if audio.data:
             st.session_state.patient_audio[message_index] = audio
             st.session_state.tts_warning = None
-            if audio.fallback_from:
-                st.session_state.tts_provider_status = f"Patient voice: {audio.provider} (fallback from {audio.fallback_from})."
-            else:
-                st.session_state.tts_provider_status = (
-                    f"Patient voice: {audio.provider}."
-                )
+            voice_name = _format_voice_name(config["tts_voice"])
+            st.session_state.tts_provider_status = (
+                f"Patient voice: {voice_name} · generated locally"
+            )
     except TextToSpeechError as exc:
         st.session_state.tts_warning = f"{exc} Continuing with text only."
 

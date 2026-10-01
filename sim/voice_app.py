@@ -165,12 +165,13 @@ def main() -> None:
         _print_role_prefix(scenario.role)
         opening_speech_stream = create_speech_stream()
         generation_started = time.perf_counter()
-        session.opening(
-            _stream_patient_chunk(opening_speech_stream, opening_chunk_timing),
+        opening_response = session.opening(
+            _stream_patient_chunk(opening_chunk_timing),
             response_mode="voice",
         )
         generation_finished = time.perf_counter()
         _finish_streamed_response()
+        opening_speech_stream.add_chunk(opening_response)
         opening_speech_stream.finish(session.transcript[-1].delivery)
         opening_metrics: dict[str, Any] = {
             "llm_response_generation_seconds": _round_seconds(
@@ -260,13 +261,14 @@ def main() -> None:
             speech_stream = create_speech_stream()
             chunk_timing: dict[str, float] = {}
             generation_started = time.perf_counter()
-            session.respond(
+            patient_response = session.respond(
                 transcript,
-                _stream_patient_chunk(speech_stream, chunk_timing),
+                _stream_patient_chunk(chunk_timing),
                 response_mode="voice",
             )
             generation_finished = time.perf_counter()
             _finish_streamed_response()
+            speech_stream.add_chunk(patient_response)
             speech_stream.finish(session.transcript[-1].delivery)
 
             first_token_at = chunk_timing.get("first_token_at")
@@ -351,12 +353,11 @@ def _print_stream_chunk(chunk: str) -> None:
     print(chunk, end="", flush=True)
 
 
-def _stream_patient_chunk(speech_stream, timing: dict[str, float]):
+def _stream_patient_chunk(timing: dict[str, float]):
     def callback(chunk: str) -> None:
         if chunk and "first_token_at" not in timing:
             timing["first_token_at"] = time.perf_counter()
         _print_stream_chunk(chunk)
-        speech_stream.add_chunk(chunk)
 
     return callback
 

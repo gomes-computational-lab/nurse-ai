@@ -3,16 +3,24 @@ from __future__ import annotations
 from typing import Callable, Literal
 
 from sim.models import Message, Scenario
-from sim.ollama_client import OllamaClient
+from sim.ollama_client import OllamaClient, OllamaError
 from sim.voice_delivery import (
     DeliveryStreamParser,
     DeliveryStyle,
+    UnsafeVoiceResponseError,
     parse_delivery_response,
 )
 
 
 ResponseMode = Literal["text", "voice"]
 VOICE_MAX_TOKENS = 120
+VOICE_RETRY_TEMPERATURE = 0.2
+VOICE_RETRY_INSTRUCTION = (
+    "Regenerate the same patient reply. Begin with exactly one valid [[delivery]] "
+    "header containing only emotion, intensity, and pace. After [[/delivery]], "
+    "write only the patient's naturally spoken words. Do not include JSON, labels, "
+    "Markdown, repeated tags, or internal clinical metadata in the spoken words."
+)
 
 
 class SimulationSession:
@@ -46,8 +54,8 @@ class SimulationSession:
             student_response=student_response,
             response_mode=response_mode,
         )
-        self.transcript.append(Message(role="student", content=student_response))
         response, delivery = self._patient_chat(messages, on_chunk, response_mode)
+        self.transcript.append(Message(role="student", content=student_response))
         self.transcript.append(
             Message(role="patient", content=response, delivery=delivery)
         )
@@ -69,8 +77,10 @@ class SimulationSession:
             raw = self.client.chat(
                 messages, temperature=0.75, max_tokens=VOICE_MAX_TOKENS
             )
-            response, delivery = parse_delivery_response(raw)
-            return response, delivery
+            try:
+                return parse_delivery_response(raw)
+            except UnsafeVoiceResponseError:
+                return self._retry_voice_response(messages)
 
         parser = DeliveryStreamParser(on_chunk)
         raw = self.client.chat(
@@ -81,7 +91,30 @@ class SimulationSession:
         )
         if not parser.received_input:
             parser.add_chunk(raw)
-        return parser.finish()
+        try:
+            return parser.finish()
+        except UnsafeVoiceResponseError:
+            return self._retry_voice_response(messages)
+
+    def _retry_voice_response(
+        self,
+        messages: list[dict[str, str]],
+    ) -> tuple[str, DeliveryStyle]:
+        retry_messages = [
+            *messages,
+            {"role": "user", "content": VOICE_RETRY_INSTRUCTION},
+        ]
+        retry_raw = self.client.chat(
+            retry_messages,
+            temperature=VOICE_RETRY_TEMPERATURE,
+            max_tokens=VOICE_MAX_TOKENS,
+        )
+        try:
+            return parse_delivery_response(retry_raw)
+        except UnsafeVoiceResponseError as exc:
+            raise OllamaError(
+                "The patient response could not be prepared safely. Please try again."
+            ) from exc
 
     def opening_prompt_char_count(self, *, response_mode: ResponseMode = "text") -> int:
         return self._prompt_char_count(
@@ -114,11 +147,15 @@ class SimulationSession:
                 "- Respond in one to three short, naturally punctuated spoken sentences.\n"
                 "- First output exactly one hidden delivery header in this format:\n"
                 '  [[delivery]]{"emotion":"anxious","intensity":2,"pace":"slow"}[[/delivery]]\n'
+                "- The header must be the first output and appear exactly once.\n"
+                "- The header JSON must contain only emotion, intensity, and pace.\n"
                 "- Valid emotions: neutral, anxious, fearful, frustrated, confused, relieved, sad, in_pain, tired.\n"
                 "- Intensity must be 1, 2, or 3. Pace must be slow, normal, or fast.\n"
                 "- Base delivery on the patient's current state and keep it subtle and clinically plausible.\n"
                 "- After the header, output only the words the patient says.\n"
-                "- Do not use Markdown, lists, stage directions, or parenthetical actions."
+                "- Never repeat either delivery tag after the patient words.\n"
+                "- Do not use Markdown, JSON, lists, field labels, stage directions, or parenthetical actions.\n"
+                "- Never prefix patient words with labels such as Pain level, Emotion, Intensity, Pace, or Delivery."
             )
         messages = [{"role": "system", "content": system_prompt}]
 

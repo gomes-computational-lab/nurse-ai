@@ -40,6 +40,7 @@ class StorageTests(unittest.TestCase):
             payload["transcript"][0]["delivery"],
             {"emotion": "anxious", "intensity": 2, "pace": "slow"},
         )
+        self.assertEqual(payload["transcript"][0]["content"], "Please help me.")
 
 
 if __name__ == "__main__":

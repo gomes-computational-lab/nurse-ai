@@ -11,10 +11,15 @@ import numpy as np
 from sim.audio import RecordedAudio, VoiceActivityDetectionUnavailable
 from sim.expressive_tts import SynthesizedAudio
 from sim.models import Message, Scenario
-from sim.ollama_client import OllamaClient
-from sim.session import SimulationSession, VOICE_MAX_TOKENS
+from sim.ollama_client import OllamaClient, OllamaError
+from sim.session import (
+    SimulationSession,
+    VOICE_MAX_TOKENS,
+    VOICE_RETRY_TEMPERATURE,
+)
 from sim.speech_to_text import transcribe_audio, transcribe_audio_bytes
 from sim.text_to_speech import SpeechMetrics
+from sim.voice_delivery import DEFAULT_DELIVERY
 
 
 class FakeWhisperModel:
@@ -66,9 +71,10 @@ class VoiceInterfaceTests(unittest.TestCase):
             def __init__(self):
                 self.finished = False
                 self.wait_calls = 0
+                self.chunks = []
 
             def add_chunk(self, chunk):
-                del chunk
+                self.chunks.append(chunk)
 
             def finish(self, delivery=None):
                 del delivery
@@ -141,6 +147,8 @@ class VoiceInterfaceTests(unittest.TestCase):
 
         self.assertTrue(all(stream.finished for stream in streams))
         self.assertTrue(all(stream.wait_calls == 1 for stream in streams))
+        self.assertEqual(streams[0].chunks, ["Opening response."])
+        self.assertEqual(streams[1].chunks, ["Patient response."])
         stop_speaking.assert_called_once_with()
 
     def test_transcription_accepts_samples_and_enables_residual_vad(self) -> None:
@@ -247,6 +255,8 @@ class VoiceInterfaceTests(unittest.TestCase):
         self.assertIn("one to three short", system_prompt)
         self.assertIn("[[delivery]]", system_prompt)
         self.assertIn("Do not use Markdown", system_prompt)
+        self.assertIn("appear exactly once", system_prompt)
+        self.assertIn("Pain level", system_prompt)
 
     def test_voice_mode_strips_delivery_header_from_stream_and_transcript(self) -> None:
         class DeliveryClient:
@@ -270,6 +280,96 @@ class VoiceInterfaceTests(unittest.TestCase):
         self.assertEqual("".join(visible), response)
         self.assertNotIn("delivery", session.transcript[0].content)
         self.assertEqual(session.transcript[0].delivery.emotion, "in_pain")
+
+    def test_malformed_streamed_response_retries_once_without_streaming_retry(
+        self,
+    ) -> None:
+        class RetryClient:
+            def __init__(self):
+                self.calls = []
+
+            def chat(self, messages, **kwargs):
+                self.calls.append({"messages": messages, **kwargs})
+                if len(self.calls) == 1:
+                    response = "Pain level: 8/10\nPlease help me."
+                    kwargs["on_chunk"](response)
+                    return response
+                return (
+                    '[[delivery]]{"emotion":"in_pain","intensity":2,'
+                    '"pace":"slow"}[[/delivery]]\nMy pain is 8 out of 10.'
+                )
+
+        client = RetryClient()
+        visible: list[str] = []
+        session = SimulationSession(scenario(), client)
+
+        response = session.opening(visible.append, response_mode="voice")
+
+        self.assertEqual(response, "My pain is 8 out of 10.")
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(client.calls[1]["temperature"], VOICE_RETRY_TEMPERATURE)
+        self.assertNotIn("on_chunk", client.calls[1])
+        self.assertIn(
+            "Regenerate the same patient reply",
+            client.calls[1]["messages"][-1]["content"],
+        )
+        self.assertEqual(session.transcript[0].content, response)
+        self.assertEqual(session.transcript[0].delivery.emotion, "in_pain")
+
+    def test_invalid_delivery_header_uses_neutral_voice_without_retry(self) -> None:
+        class InvalidDeliveryClient:
+            def __init__(self):
+                self.calls = 0
+
+            def chat(self, messages, **kwargs):
+                del messages
+                self.calls += 1
+                response = (
+                    '[[delivery]]{"emotion":"dramatic","intensity":9,'
+                    '"pace":"slow"}[[/delivery]]\nPlease stay with me.'
+                )
+                callback = kwargs.get("on_chunk")
+                if callback is not None:
+                    callback(response)
+                return response
+
+        client = InvalidDeliveryClient()
+        session = SimulationSession(scenario(), client)
+
+        response = session.opening(lambda chunk: None, response_mode="voice")
+
+        self.assertEqual(response, "Please stay with me.")
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(session.transcript[0].delivery, DEFAULT_DELIVERY)
+
+    def test_two_malformed_responses_leave_turn_uncommitted(self) -> None:
+        class InvalidClient:
+            def __init__(self):
+                self.calls = 0
+
+            def chat(self, messages, **kwargs):
+                del messages
+                self.calls += 1
+                response = "Emotion: anxious\nPlease help me."
+                callback = kwargs.get("on_chunk")
+                if callback is not None:
+                    callback(response)
+                return response
+
+        client = InvalidClient()
+        session = SimulationSession(scenario(), client)
+        session.transcript.append(Message(role="patient", content="How can you help?"))
+        before = list(session.transcript)
+
+        with self.assertRaisesRegex(OllamaError, "prepared safely"):
+            session.respond(
+                "I will assess your pain.",
+                lambda chunk: None,
+                response_mode="voice",
+            )
+
+        self.assertEqual(client.calls, 2)
+        self.assertEqual(session.transcript, before)
 
     def test_text_mode_keeps_unlimited_generation_and_original_prompt(self) -> None:
         client = FakeClient()
