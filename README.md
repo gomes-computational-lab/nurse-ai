@@ -53,6 +53,27 @@ Run a specific scenario:
 python3 main.py --scenario post_op_pain
 ```
 
+## Run the Streamlit voice conversation
+
+```bash
+python3 -m streamlit run app/streamlit_app.py
+```
+
+Choose a scenario and click **Start simulation**, then allow browser microphone
+access. If the browser asks for an additional interaction, click **Enable voice**.
+Speak and pause: after 0.7 seconds of quiet, the app automatically transcribes your
+utterance and generates a reply. There is no Send message button. The browser
+reads the reply aloud, then automatically listens for your next turn.
+
+Adjust **Pause before responding** and **Microphone sensitivity** before starting.
+Pause detection uses microphone volume, so background noise can affect it.
+Whisper also filters the captured audio for speech. Quiet periods don't submit
+messages, and individual recordings are limited to 60 seconds. **End and save**
+stops listening and saves completed conversation turns; speech still in progress
+is discarded. Browser microphone access requires localhost or HTTPS.
+
+This UI uses browser speech synthesis; the terminal demo below uses Edge TTS.
+
 ## Run The Voice Demo
 
 ```bash
