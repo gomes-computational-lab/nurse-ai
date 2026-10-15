@@ -20,16 +20,9 @@ CRITERIA = (
 
 
 def evaluate_transcript(scenario: Scenario, transcript: list[Message], client: OllamaClient) -> dict[str, Any]:
-    criteria: dict[str, dict[str, Any]] = {}
-    failures: list[str] = []
-    for criterion in CRITERIA:
-        result, error = _evaluate_criterion(scenario, transcript, criterion, client)
-        criteria[criterion["name"]] = result
-        if error:
-            failures.append(error)
-
-    if failures:
-        return _invalid_feedback(" ".join(failures), criteria)
+    criteria, error = _evaluate_criteria(scenario, transcript, client)
+    if error:
+        return _invalid_feedback(error, criteria)
 
     overall_score = round(sum(result["score"] for result in criteria.values()) / len(criteria), 2)
     return {
@@ -42,41 +35,63 @@ def evaluate_transcript(scenario: Scenario, transcript: list[Message], client: O
     }
 
 
-def _evaluate_criterion(
+def _evaluate_criteria(
     scenario: Scenario,
     transcript: list[Message],
-    criterion: dict[str, str],
     client: OllamaClient,
-) -> tuple[dict[str, Any], str | None]:
+) -> tuple[dict[str, dict[str, Any]], str | None]:
     messages = [
-        {"role": "system", "content": _system_prompt(scenario, criterion)},
+        {"role": "system", "content": _system_prompt(scenario)},
         {"role": "user", "content": _transcript_payload(transcript)},
     ]
-    raw = client.chat(messages, temperature=0.1, format_json=True, max_tokens=600)
+    original_timeout = client.timeout
+    client.timeout = 600
     try:
-        result = json.loads(raw)
+        raw = client.chat(messages, temperature=0.1, format_json=True, max_tokens=4200)
+    finally:
+        client.timeout = original_timeout
+    empty = {criterion["name"]: _empty_criterion() for criterion in CRITERIA}
+    try:
+        payload = json.loads(raw)
     except json.JSONDecodeError:
-        return _empty_criterion(), f"{criterion['name']}: evaluator returned non-JSON feedback."
+        return empty, "Evaluator returned non-JSON feedback."
 
-    validation_error = _validate_criterion(result)
-    if validation_error:
-        return _empty_criterion(), f"{criterion['name']}: {validation_error}"
-    return result, None
+    if not isinstance(payload, dict) or set(payload) != {"criteria"}:
+        return empty, "Evaluator response must contain a criteria array."
+    results = payload["criteria"]
+    if not isinstance(results, list) or len(results) != len(CRITERIA):
+        return empty, "Evaluator must return all 7 criteria."
+    for result in results:
+        if not isinstance(result, dict) or set(result) != CRITERION_FIELDS | {"name"}:
+            return empty, "Evaluator response does not match the required criterion schema."
+    names = [result["name"] for result in results]
+    if not all(isinstance(name, str) for name in names) or set(names) != set(empty):
+        return empty, "Evaluator returned missing, duplicate, or unknown criterion names."
+
+    criteria = {}
+    for result in results:
+        name = result["name"]
+        feedback = {key: result[key] for key in CRITERION_FIELDS}
+        validation_error = _validate_criterion(feedback)
+        if validation_error:
+            return empty, f"{name}: {validation_error}"
+        criteria[name] = feedback
+    return {criterion["name"]: criteria[criterion["name"]] for criterion in CRITERIA}, None
 
 
-def _system_prompt(scenario: Scenario, criterion: dict[str, str]) -> str:
+def _system_prompt(scenario: Scenario) -> str:
     context = json.dumps(
         {
             "scenario": {"title": scenario.title, "setting": scenario.setting},
             "learning_objectives": scenario.learning_objectives,
             "scenario_rubric": scenario.evaluation_rubric,
-            "criterion": criterion,
+            "criteria": CRITERIA,
         },
         ensure_ascii=False,
         indent=2,
     )
     return f"""
-You are a nursing simulation evaluator. Score only the single trusted criterion below.
+You are a nursing simulation evaluator. Score all 7 trusted criteria below in one response.
 Be specific, fair, and grounded only in the nursing student's words. Do not invent actions.
 
 Security boundary:
@@ -96,8 +111,19 @@ Scoring scale:
 4 = good and mostly complete with minor gaps.
 5 = excellent, specific, patient-centered, and complete.
 
-Return exactly one JSON object with these fields and no others:
+Evaluate each criterion independently; strength in one does not establish another.
+Evidence must be based directly on the student's actual words. Do not invent actions.
+Distinguish stated plans from completed actions; give credit only for what was demonstrated.
+Score 5 only when the criterion is fully demonstrated, not merely mentioned.
+When evidence is partial, reflect the missing elements in the score and coaching.
+If no student evidence supports a criterion, use score 1.
+
+Return exactly one JSON object containing a "criteria" array of exactly 7 results.
+Use each trusted criterion name exactly once, in the order given above.
+Each result must contain exactly these fields: name, score, evidence, coaching.
+For example, each result has this structure:
 {{
+  "name": "Exact criterion name from the trusted context",
   "score": 1,
   "evidence": "Specific evidence from student responses, or state that no evidence was present.",
   "coaching": "One concrete suggestion for improvement."
