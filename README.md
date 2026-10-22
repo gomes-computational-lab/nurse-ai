@@ -201,6 +201,22 @@ Microphone capture, end-of-speech detection, and transcription remain local. Oll
 
 Transcripts and feedback are saved in `transcripts/`. Voice results also include recording, endpoint, transcription, first-text, first-audio, completion, and interruption latency metrics.
 
+## One-Call Evaluation
+
+When a simulation ends, the evaluator sends the complete transcript to Ollama once and requests all seven K-HCAT/DARE2-informed criterion results in one JSON response. The application validates the complete response and calculates the overall score locally. Patient, family-member, and facilitator messages remain context only; only student messages are graded. Learner `speaker_role`, scenario phase, and fictional timeline information are retained as evaluation context.
+
+Evaluate an existing saved result independently:
+
+```bash
+python3 -m sim.evaluate_file transcripts/<saved-result>.json
+```
+
+The command uses the same `--host` and `--model` options and `OLLAMA_BASE_URL`/`OLLAMA_MODEL` environment variables as the simulation. A bare JSON message array is also supported when its scenario is supplied explicitly:
+
+```bash
+python3 -m sim.evaluate_file transcript.json --scenario post_op_pain
+```
+
 ### Understanding Voice Metrics
 
 Every new transcript includes three aids under `latency`:
@@ -235,6 +251,7 @@ voice_demo.py           Backward-compatible voice launcher
 sim/
   app.py                Typed terminal app flow
   audio.py              Microphone recording helpers
+  evaluate_file.py      Saved-transcript evaluation command
   evaluator.py          Student-response analysis
   models.py             Scenarios, participants, learners, timelines, and messages
   ollama_client.py      Local Ollama HTTP client
@@ -268,7 +285,7 @@ The normal test suite mocks the Ollama HTTP endpoint and does not require a runn
 python3 -m unittest discover -s tests -v
 ```
 
-An optional integration test can be explicitly enabled after establishing the tunnel and exporting `OLLAMA_BASE_URL` and `OLLAMA_MODEL`:
+Optional connectivity and one-call evaluator integration tests can be explicitly enabled after establishing the tunnel and exporting `OLLAMA_BASE_URL` and `OLLAMA_MODEL`:
 
 ```bash
 RUN_OLLAMA_INTEGRATION=1 python3 -m unittest discover -s tests -p 'test_ollama_integration.py' -v
