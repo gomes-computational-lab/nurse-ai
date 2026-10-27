@@ -90,14 +90,20 @@ class OllamaClient:
         }
 
     def warmup(self) -> str:
-        return self.chat(
+        response = self.chat(
             [
                 {"role": "system", "content": "Reply with OK."},
                 {"role": "user", "content": "OK"},
             ],
             temperature=0.0,
             max_tokens=8,
+            think=False,
         )
+        if not response:
+            raise OllamaResponseError(
+                f"Ollama at {self.host} returned an empty warm-up response."
+            )
+        return response
 
     def chat(
         self,
@@ -105,7 +111,9 @@ class OllamaClient:
         *,
         temperature: float = 0.7,
         format_json: bool = False,
+        json_schema: dict[str, Any] | None = None,
         max_tokens: int | None = None,
+        think: bool | str | None = None,
         on_chunk: Callable[[str], None] | None = None,
     ) -> str:
         stream = on_chunk is not None
@@ -117,8 +125,12 @@ class OllamaClient:
         }
         if max_tokens is not None:
             payload["options"]["num_predict"] = max_tokens
-        if format_json:
+        if json_schema is not None:
+            payload["format"] = json_schema
+        elif format_json:
             payload["format"] = "json"
+        if think is not None:
+            payload["think"] = think
 
         request = urllib.request.Request(
             f"{self.host}/api/chat",

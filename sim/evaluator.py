@@ -61,6 +61,36 @@ CRITERIA = (
         "low_score": "Ignores safety risks, omits necessary escalation, or gives unsafe advice.",
     },
 )
+EVALUATION_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "criteria": {
+            "type": "array",
+            "minItems": len(CRITERIA),
+            "maxItems": len(CRITERIA),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "enum": [criterion["name"] for criterion in CRITERIA],
+                    },
+                    "score": {
+                        "type": "number",
+                        "minimum": 1,
+                        "maximum": 5,
+                    },
+                    "evidence": {"type": "string", "minLength": 1},
+                    "coaching": {"type": "string", "minLength": 1},
+                },
+                "required": ["name", "score", "evidence", "coaching"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["criteria"],
+    "additionalProperties": False,
+}
 
 
 def evaluate_transcript(
@@ -98,8 +128,9 @@ def _evaluate_criteria(
     raw = client.chat(
         messages,
         temperature=0.1,
-        format_json=True,
+        json_schema=EVALUATION_JSON_SCHEMA,
         max_tokens=EVALUATION_MAX_TOKENS,
+        think=False,
     )
     empty = _empty_criteria()
 

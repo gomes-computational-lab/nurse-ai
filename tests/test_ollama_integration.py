@@ -22,11 +22,7 @@ class OllamaIntegrationTests(unittest.TestCase):
         )
 
         health = client.health_check()
-        response = client.chat(
-            [{"role": "user", "content": "Reply with exactly: OK"}],
-            temperature=0.0,
-            max_tokens=8,
-        )
+        response = client.warmup()
 
         self.assertEqual(health["model"], configured_model())
         self.assertTrue(response.strip())
