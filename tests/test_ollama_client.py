@@ -159,6 +159,72 @@ class OllamaClientTests(unittest.TestCase):
         self.assertEqual(result, "Hello there.")
         self.assertEqual(chunks, ["Hello", " there", "."])
 
+    def test_chat_thinking_control_is_optional_and_supports_boolean_values(self) -> None:
+        client = OllamaClient("qwen3:4b")
+
+        for think in (None, False, True):
+            with self.subTest(think=think):
+                response = FakeResponse('{"message":{"content":"OK"}}')
+                with patch(
+                    "sim.ollama_client.urllib.request.urlopen",
+                    return_value=response,
+                ) as urlopen:
+                    result = client.chat(
+                        [{"role": "user", "content": "Hello"}],
+                        think=think,
+                    )
+
+                request = urlopen.call_args.args[0]
+                payload = json.loads(request.data.decode("utf-8"))
+                self.assertEqual(result, "OK")
+                if think is None:
+                    self.assertNotIn("think", payload)
+                else:
+                    self.assertIs(payload["think"], think)
+
+    def test_chat_sends_json_schema_as_structured_output_format(self) -> None:
+        client = OllamaClient("qwen3:4b")
+        schema = {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": False,
+        }
+        response = FakeResponse('{"message":{"content":"{\\"answer\\":\\"OK\\"}"}}')
+
+        with patch(
+            "sim.ollama_client.urllib.request.urlopen",
+            return_value=response,
+        ) as urlopen:
+            result = client.chat(
+                [{"role": "user", "content": "Hello"}],
+                format_json=True,
+                json_schema=schema,
+            )
+
+        request = urlopen.call_args.args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(result, '{"answer":"OK"}')
+        self.assertEqual(payload["format"], schema)
+
+    def test_warmup_disables_thinking_and_rejects_empty_content(self) -> None:
+        client = OllamaClient("qwen3:4b")
+        responses = [
+            FakeResponse('{"message":{"content":"OK"}}'),
+            FakeResponse('{"message":{"content":""}}'),
+        ]
+
+        with patch(
+            "sim.ollama_client.urllib.request.urlopen",
+            side_effect=responses,
+        ) as urlopen:
+            self.assertEqual(client.warmup(), "OK")
+            first_request = urlopen.call_args_list[0].args[0]
+            first_payload = json.loads(first_request.data.decode("utf-8"))
+            self.assertIs(first_payload["think"], False)
+            with self.assertRaisesRegex(OllamaResponseError, "empty warm-up response"):
+                client.warmup()
+
     def test_check_llm_cli_options_override_environment(self) -> None:
         class FakeClient:
             def health_check(self):
