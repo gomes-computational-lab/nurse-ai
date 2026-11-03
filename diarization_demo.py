@@ -11,6 +11,15 @@ import time
 import numpy as np
 
 from sim.audio import DEFAULT_SAMPLE_RATE
+from sim.diarization import (
+    DiarizationConfig,
+    PyannoteDiarizationProvider,
+    RecognizedWord,
+    UtteranceStatus,
+    VoiceTracker,
+    align_words_to_speakers,
+    to_session_speaker_turns,
+)
 from sim.speech_to_text import DEFAULT_STT_MODEL
 
 # Reading guide: main() selects options and loads models, then run_live() captures
@@ -29,74 +38,6 @@ from sim.speech_to_text import DEFAULT_STT_MODEL
 
 # This is a pretrained pipeline, not a model trained or fine-tuned by this demo.
 MODEL = "pyannote/speaker-diarization-community-1"
-
-
-class VoiceTracker:
-    """Match window-local speakers to at most two session voice profiles.
-
-    An embedding is a numeric description of voice characteristics. Profiles are
-    normalized embeddings kept only in memory for this run. SPEAKER_00 means the
-    first profile created, not necessarily the nurse or the first person heard.
-    Matching uses acoustic similarity; transcript words do not affect it.
-    """
-
-    def __init__(self):
-        self.profiles: list[np.ndarray] = []
-
-    def assign(self, output, turns) -> dict[str, str]:
-        """Return local-label -> session-label matches, leaving doubts UNKNOWN."""
-        # Pyannote documents embeddings in speaker_diarization.labels() order.
-        # Use that order rather than assuming labels encode embedding row numbers.
-        labels = output.speaker_diarization.labels()
-        mapping = {label: "SPEAKER_UNKNOWN" for label in labels}
-        embeddings = output.speaker_embeddings
-        # A bad/missing embedding should not force a potentially incorrect identity.
-        if embeddings is None or embeddings.ndim != 2 or len(embeddings) != len(labels):
-            return mapping
-        durations = {label: sum(b - a for a, b, speaker in turns if speaker == label)
-                     for label in labels}
-        # Start with the longest speech so brief interjections do not seed a voice.
-        for index in sorted(range(len(labels)), key=lambda i: -durations[labels[i]]):
-            label = labels[index]
-            vector = np.asarray(embeddings[index], dtype=np.float64)
-            norm = np.linalg.norm(vector)
-            if not np.isfinite(vector).all() or norm < 1e-8:
-                continue
-            # Unit-length vectors make their dot product equal cosine similarity.
-            # Larger scores mean greater similarity, not a probability of identity.
-            vector = vector / norm
-            scores = np.array([np.dot(vector, profile) for profile in self.profiles])
-            # These cosine thresholds are demo heuristics, not calibrated probabilities.
-            # Create a profile only with >= 1 second of accumulated speech in this
-            # window and low similarity to all profiles already learned. The gap
-            # between creation (< .50) and matching (>= .60) deliberately permits
-            # UNKNOWN instead of making every voice fit one of the two profiles.
-            if len(self.profiles) < 2 and durations[label] >= 1.0 and (
-                not len(scores) or scores.max() < 0.50
-            ):
-                match = len(self.profiles)
-                self.profiles.append(vector.copy())
-            elif len(scores):
-                match = int(scores.argmax())
-                # With two profiles, demand separation from the other candidate.
-                # With only one, there is no competitor; use a fixed margin of 1.
-                margin = float(scores[match] - np.min(scores)) if len(scores) == 2 else 1.0
-                if scores[match] < 0.60 or margin < 0.10:
-                    continue
-                # Adapt slowly, only on stronger matches with enough speech.
-                # Retain 95% of the profile to limit drift from a mistaken match,
-                # then normalize again before future cosine comparisons.
-                if scores[match] >= 0.75 and margin >= 0.20 and durations[label] >= 1.0:
-                    profile = 0.95 * self.profiles[match] + 0.05 * vector
-                    self.profiles[match] = profile / np.linalg.norm(profile)
-            else:
-                continue
-            # Multiple local clusters may match the same actual person. Forcing
-            # distinct IDs here could turn two fragments of one voice into two
-            # people. Conversely, a wrong model grouping cannot be fixed reliably
-            # by this matching step alone.
-            mapping[label] = f"SPEAKER_{match:02d}"
-        return mapping
 
 
 def timestamp(seconds: float) -> str:
@@ -119,42 +60,36 @@ class Diarizer:
         self.torch = torch
         self.whisper = whisper
         self.inspect = inspect
+        self.config = DiarizationConfig(finalization_delay_seconds=0)
+        self.diarization_provider = PyannoteDiarizationProvider(
+            pipeline,
+            torch,
+            model_name=self.config.pyannote_model_name,
+            device_name="legacy-demo",
+        )
         # Times below are session-relative seconds, unlike the sample counters
         # in RollingAudio. No full conversation audio is accumulated here.
         self.emitted_until = 0.0
-        self.voices = VoiceTracker()
+        self.voices = VoiceTracker(self.config)
 
     def process(self, samples: np.ndarray, start: float) -> None:
         """Analyze one mono snapshot starting at session time ``start``."""
         end = start + len(samples) / DEFAULT_SAMPLE_RATE
         began = time.perf_counter()
-        # Gradients are unnecessary for inference. Add a channel dimension to
-        # turn a [samples] array into Pyannote's [channels, samples] tensor.
-        # A two-person conversation may contain only one voice in a given window.
-        # Allow the model to find one or two speakers rather than forcing two.
-        with self.torch.inference_mode():
-            output = self.pipeline(
-                {"waveform": self.torch.from_numpy(samples).unsqueeze(0),
-                 "sample_rate": DEFAULT_SAMPLE_RATE},
-                min_speakers=1,
-                max_speakers=2,
-            )
-        turns = [
-            (max(start, start + turn.start), min(end, start + turn.end), speaker)
-            for turn, _, speaker in output.speaker_diarization.itertracks(yield_label=True)
-        ]
-        # Voice profiles match local cluster IDs to session IDs automatically.
-        mapping = self.voices.assign(output, turns)
-        # Community-1's exclusive turns avoid choosing arbitrarily between
-        # simultaneous speakers when aligning a single recognized word.
-        local_turns = [
-            (max(start, start + turn.start), min(end, start + turn.end), speaker)
-            for turn, _, speaker in output.exclusive_speaker_diarization.itertracks(yield_label=True)
-        ]
-        # Both annotations use the session clock, clipped to snapshot boundaries.
-        # Keep local labels alongside tracked ones for the inspection display.
-        turns = [(a, b, mapping.get(speaker, "SPEAKER_UNKNOWN"))
-                 for a, b, speaker in local_turns]
+        frame = self.diarization_provider.diarize(
+            samples,
+            sample_rate=self.config.sample_rate,
+            min_speakers=self.config.min_speakers,
+            max_speakers=self.config.max_speakers,
+        )
+        mapping = self.voices.assign(frame)
+        # Exclusive turns avoid arbitrary word attribution during overlapping speech.
+        turns = to_session_speaker_turns(
+            frame.exclusive_speaker_turns,
+            mapping,
+            window_start=start,
+            window_end=end,
+        )
         if start > self.emitted_until + 0.001:
             # The ring buffer may overwrite audio while a slow inference runs.
             # Make any resulting gap in finalized output explicit to the user.
@@ -163,10 +98,11 @@ class Diarizer:
         if self.inspect:
             # Print acoustic turns even if Whisper returns no words. The local
             # ID exposes model groups before cross-window voice matching.
-            for (a, b, label), (_, _, local) in zip(turns, local_turns):
-                a, b = max(a, self.emitted_until), min(b, end)
+            for turn in turns:
+                a, b = max(turn.start, self.emitted_until), min(turn.end, end)
                 if b > a:
-                    print(f"[TURN {timestamp(a)}-{timestamp(b)}] {label} (model={local})", flush=True)
+                    print(f"[TURN {timestamp(a)}-{timestamp(b)}] {turn.speaker_id} "
+                          f"(model={turn.source_speaker_id})", flush=True)
             words = self.recognize(samples, start)
             if words:
                 a = max(words[0][0], self.emitted_until)
@@ -178,10 +114,11 @@ class Diarizer:
         elif turns:
             # Normal view joins recognized words to tracked session speakers.
             lines = self.transcribe(samples, start, turns)
-            for a, b, label, text in lines:
-                print(f"[{timestamp(a)}-{timestamp(b)}] {label}: {text}", flush=True)
-            if not lines and any(min(b, end) > max(a, self.emitted_until)
-                                 for a, b, _ in turns):
+            for line in lines:
+                print(f"[{timestamp(line.start)}-{timestamp(line.end)}] "
+                      f"{line.speaker_id}: {line.text}", flush=True)
+            if not lines and any(min(turn.end, end) > max(turn.start, self.emitted_until)
+                                 for turn in turns):
                 # Speech turns and recognized words come from different models.
                 # This can mean empty STT or no words passing time/turn alignment;
                 # it does not mean the vocabulary has already appeared before.
@@ -196,8 +133,8 @@ class Diarizer:
         if self.inspect:
             peak = 20 * np.log10(max(float(np.max(np.abs(samples))), 1e-12))
             details = f"; input RMS {level:.0f} dBFS, peak {peak:.0f} dBFS"
-            details += f"; model={len({speaker for _, _, speaker in local_turns})}"
-            known = {speaker for _, _, speaker in turns} - {"SPEAKER_UNKNOWN"}
+            details += f"; model={len({turn.speaker_id for turn in frame.exclusive_speaker_turns})}"
+            known = {turn.speaker_id for turn in turns} - {"SPEAKER_UNKNOWN"}
             details += f", tracked={len(known)}, profiles={len(self.voices.profiles)}/2"
         else:
             details = f" (no speech; input {level:.0f} dBFS)" if not turns else ""
@@ -249,22 +186,12 @@ class Diarizer:
         speaker are grouped for display, even across pauses. These printed lines
         are convenient output groups, not guaranteed complete sentences or turns.
         """
-        lines: list[tuple[float, float, str, str]] = []
-        for a, b, text in self.recognize(samples, start):
-            turn = max(turns, key=lambda turn: max(0.0, min(b, turn[1]) - max(a, turn[0])))
-            if min(b, turn[1]) <= max(a, turn[0]):
-                # Avoid assigning text to a speaker without detected speech there.
-                # This also drops real words when diarization misses their speech;
-                # inspection mode helps expose that disagreement.
-                continue
-            a = max(a, self.emitted_until)
-            label = turn[2]
-            if lines and lines[-1][2] == label:
-                old_a, _, _, old_text = lines[-1]
-                lines[-1] = (old_a, max(lines[-1][1], b), label, old_text + " " + text)
-            else:
-                lines.append((a, b, label, text))
-        return lines
+        words = tuple(
+            RecognizedWord(max(a, self.emitted_until), b, text)
+            for a, b, text in self.recognize(samples, start)
+            if b > max(a, self.emitted_until)
+        )
+        return align_words_to_speakers(words, turns, status=UtteranceStatus.FINALIZED)
 
 
 def load_diarizer(stt_model: str = DEFAULT_STT_MODEL, inspect: bool = False) -> Diarizer:

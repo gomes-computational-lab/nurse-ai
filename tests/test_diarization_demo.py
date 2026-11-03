@@ -7,6 +7,17 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from diarization_demo import DEFAULT_SAMPLE_RATE, Diarizer, VoiceTracker, main, run_live
+from sim.diarization import DiarizationFrame, LocalSpeakerTurn
+
+
+def tracking_frame(turns, embeddings):
+    local_turns = tuple(LocalSpeakerTurn(a, b, label) for a, b, label in turns)
+    return DiarizationFrame(
+        speaker_turns=local_turns,
+        exclusive_speaker_turns=local_turns,
+        speaker_labels=tuple(sorted({label for _, _, label in turns})),
+        speaker_embeddings=tuple(tuple(value for value in row) for row in embeddings),
+    )
 
 
 class DiarizationDemoTests(unittest.TestCase):
@@ -59,20 +70,24 @@ class DiarizationDemoTests(unittest.TestCase):
 
         # Session voice matching survives a gap and reversed local cluster IDs.
         voices = VoiceTracker()
-        duplicate = output([(0, 3, "SPEAKER_00"), (3, 6, "SPEAKER_01")],
-                           [[1, 0, 0], [1, .01, 0]])
-        self.assertEqual(voices.assign(duplicate, [(0, 3, "SPEAKER_00"), (3, 6, "SPEAKER_01")]),
+        duplicate = tracking_frame(
+            [(0, 3, "SPEAKER_00"), (3, 6, "SPEAKER_01")],
+            [[1, 0, 0], [1, .01, 0]],
+        )
+        self.assertEqual(voices.assign(duplicate),
                          {"SPEAKER_00": "SPEAKER_00", "SPEAKER_01": "SPEAKER_00"})
-        second = output([(0, 6, "SPEAKER_00")], [[0, 1, 0]])
-        self.assertEqual(voices.assign(second, [(20, 26, "SPEAKER_00")]),
+        second = tracking_frame([(0, 6, "SPEAKER_00")], [[0, 1, 0]])
+        self.assertEqual(voices.assign(second),
                          {"SPEAKER_00": "SPEAKER_01"})
-        reversed_voices = output([(0, 3, "SPEAKER_00"), (3, 6, "SPEAKER_01")],
-                                 [[0, 1, 0], [1, 0, 0]])
-        self.assertEqual(voices.assign(reversed_voices, [(50, 53, "SPEAKER_00"), (53, 56, "SPEAKER_01")]),
+        reversed_voices = tracking_frame(
+            [(0, 3, "SPEAKER_00"), (3, 6, "SPEAKER_01")],
+            [[0, 1, 0], [1, 0, 0]],
+        )
+        self.assertEqual(voices.assign(reversed_voices),
                          {"SPEAKER_00": "SPEAKER_01", "SPEAKER_01": "SPEAKER_00"})
         for vector in ([1, 1, 0], [0, 0, 1], [0, 0, 0], [float("nan"), 0, 0]):
-            unclear = output([(0, 6, "SPEAKER_00")], [vector])
-            self.assertEqual(voices.assign(unclear, [(60, 66, "SPEAKER_00")]),
+            unclear = tracking_frame([(0, 6, "SPEAKER_00")], [vector])
+            self.assertEqual(voices.assign(unclear),
                              {"SPEAKER_00": "SPEAKER_UNKNOWN"})
         self.assertEqual(len(voices.profiles), 2)
 
