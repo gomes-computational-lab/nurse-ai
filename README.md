@@ -243,6 +243,18 @@ The most useful metrics are:
 
 `captured_audio_duration_seconds` includes pre-roll and trailing silence, while `detected_speech_duration_seconds` counts only frames classified as speech. `llm_prompt_characters` is a prompt-size measurement, not a duration.
 
+## Live Speaker Diarization and STT
+
+The standalone [diarization demo](demos/diarization/README.md) listens to two speakers
+and prints timestamps, speaker IDs, and local Whisper transcription. It also supports
+WAV replay, independent speaker/STT inspection, optional nurse/patient role estimates,
+and a transcript comparison helper. It does not require Ollama.
+
+Install it in its own environment using the linked guide; its Pyannote/PyTorch
+dependencies are separate from the simulation requirements. Windows CUDA has been
+used locally. Apple Silicon dependency resolution has been checked, but Mac runtime
+and live performance still need testing; the current code uses CPU on macOS.
+
 ## Project Layout
 
 ```text
