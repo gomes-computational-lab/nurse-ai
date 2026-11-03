@@ -246,8 +246,8 @@ The most useful metrics are:
 ## Live Speaker Diarization and STT
 
 The standalone [diarization demo](demos/diarization/README.md) listens to two speakers
-and prints timestamps, speaker IDs, and local Whisper transcription. It also supports
-WAV replay, independent speaker/STT inspection, and optional nurse/patient role
+and prints timestamps, speaker IDs, and local Whisper transcription from a microphone.
+It also supports independent speaker/STT inspection and optional nurse/patient role
 estimates. It does not require Ollama.
 
 Run it through the shared entry point using the demo's Python environment:

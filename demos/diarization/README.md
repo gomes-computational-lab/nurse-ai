@@ -1,7 +1,7 @@
 # Live two-speaker diarization and STT
 
 `python main.py --diarization` prints timestamps, speaker IDs, and local Whisper text
-from a microphone or WAV file. The implementation lives in `diarization_demo.py`,
+from a microphone. The implementation lives in `diarization_demo.py`,
 which can also be run directly. Pyannote Community-1 supplies speaker turns.
 Optional session voice profiles match IDs across windows. This standalone experiment
 does not call Ollama or decide when an LLM should speak.
@@ -56,8 +56,8 @@ HF_TOKEN=hf_YOUR_READ_TOKEN
 
 An environment value takes precedence over `.env`. Do not commit tokens. The first
 run downloads Pyannote and Whisper weights and needs internet; later runs can reuse
-cached weights. Pyannote metrics are disabled by default. Live and compatible WAV
-input are passed as tensors and do not require FFmpeg.
+cached weights. Pyannote metrics are disabled by default. Microphone audio is passed
+as tensors and does not require FFmpeg.
 
 ## Microphone and live output
 
@@ -134,26 +134,12 @@ on CPU with int8 computation. `--stt-model base.en` uses a larger English model 
 additional processing cost. Other languages need a multilingual model, for example
 `--stt-model tiny --language pt`.
 
-## WAV replay and delayed finalization
-
-```bash
-python main.py --diarization --wav path/to/conversation.wav --track-speakers --window 15 --step 3
-```
-
-Input must be 16 kHz mono 16-bit PCM WAV. Convert other formats with an independently
-installed FFmpeg:
-
-```bash
-ffmpeg -i input.mp4 -ac 1 -ar 16000 -c:a pcm_s16le conversation.wav
-```
-
-WAV mode processes overlapping windows without real-time playback waits. Compare
-configurations on the same file to avoid microphone/playback variation.
+## Optional delayed finalization
 
 Optional `--holdback 3` defers finalizing the newest three seconds for more context.
 It adds latency and is not consistently better across recordings; the default is
-zero. Require `0 <= holdback <= window - step`. WAV mode flushes the final interval.
-With positive holdback, live Ctrl+C closes capture and processes the buffered tail
+zero. Require `0 <= holdback <= window - step`.
+With positive holdback, Ctrl+C closes capture and processes the buffered tail
 before exiting, which can take a few seconds. Zero holdback does not flush that tail.
 
 ## Limitations and checks

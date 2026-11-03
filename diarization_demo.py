@@ -1,4 +1,4 @@
-"""Isolated two-speaker Pyannote demo; see demos/diarization/README.md."""
+"""Live two-speaker Pyannote demo; see demos/diarization/README.md."""
 from __future__ import annotations
 
 import argparse
@@ -8,7 +8,6 @@ import re
 import sys
 import threading
 import time
-import wave
 
 import numpy as np
 
@@ -125,7 +124,7 @@ def timestamp(seconds: float) -> str:
 
 
 class Diarizer:
-    """One processing path for WAV windows and microphone windows."""
+    """Process rolling microphone windows and emit speaker turns and text."""
 
     def __init__(self, pipeline, torch, whisper=None, language: str | None = "en",
                  nurse_patient: bool = False, holdback: float = 0.0,
@@ -317,7 +316,7 @@ def load_diarizer(stt_model: str | None = DEFAULT_STT_MODEL, language: str | Non
                            "beginning with hf_, without quotes or whitespace.")
     os.environ.setdefault("PYANNOTE_METRICS_ENABLED", "false")
     print(f"Loading {MODEL} (first run imports dependencies and downloads model files)...", flush=True)
-    # Both inputs are tensors: the optional TorchCodec/FFmpeg file decoder is unused.
+    # Microphone input is a tensor: the optional TorchCodec/FFmpeg decoder is unused.
     import warnings
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=r"\s*torchcodec is not installed correctly.*")
@@ -345,29 +344,6 @@ def load_diarizer(stt_model: str | None = DEFAULT_STT_MODEL, language: str | Non
         whisper = _load_model(stt_model)
     return Diarizer(pipeline, torch, whisper, language, nurse_patient=nurse_patient, holdback=holdback,
                     track_speakers=track_speakers, inspect=inspect)
-
-
-def validate_wav(path: Path) -> int:
-    with wave.open(str(path), "rb") as wav:
-        if (wav.getframerate(), wav.getnchannels(), wav.getsampwidth()) != (16000, 1, 2):
-            raise ValueError("WAV must be 16 kHz mono 16-bit PCM. See the README conversion command.")
-        if not wav.getnframes():
-            raise ValueError("WAV is empty.")
-        return wav.getnframes()
-
-
-def run_wav(path: Path, diarizer: Diarizer, window: int, step: int) -> None:
-    with wave.open(str(path), "rb") as wav:
-        total = wav.getnframes()
-        end = min(window, total)
-        while True:
-            start = max(0, end - window)
-            wav.setpos(start)
-            samples = np.frombuffer(wav.readframes(end - start), dtype="<i2").astype(np.float32) / 32768.0
-            diarizer.process(samples, start / DEFAULT_SAMPLE_RATE, final=end == total)
-            if end == total:
-                return
-            end = min(end + step, total)
 
 
 class RollingAudio:
@@ -486,7 +462,6 @@ def run_live(diarizer: Diarizer | None, device: int | None, window: int, step: i
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--wav", type=Path, help="Analyze a 16 kHz mono 16-bit PCM WAV first.")
     parser.add_argument("--list-devices", action="store_true", help="List microphone IDs; no model/token needed.")
     parser.add_argument("--device", type=int, help="Input device ID (default: system microphone).")
     parser.add_argument("--check-mic", action="store_true",
@@ -505,8 +480,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--inspect", action="store_true",
                         help="Print speaker turns, independent STT text, and input levels; omit roles.")
     args = parser.parse_args(argv)
-    if args.check_mic and args.wav is not None:
-        parser.error("--check-mic uses the microphone and cannot be combined with --wav.")
     if not (0 < args.step <= args.window < float("inf")):
         parser.error("Require 0 < --step <= --window, with finite durations.")
     if not 0 <= args.holdback <= args.window - args.step:
@@ -522,17 +495,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.list_devices:
             list_devices()
             return 0
-        if args.wav is not None:
-            validate_wav(args.wav)
-        else:
-            import sounddevice as sd
-            # Reject an invalid microphone before importing/loading the model.
-            sd.check_input_settings(device=args.device, channels=1, dtype="float32", samplerate=DEFAULT_SAMPLE_RATE)
-            info = sd.query_devices(args.device, "input")
-            print(f"Microphone: {info['name']}", flush=True)
-            if args.check_mic:
-                run_live(None, args.device, DEFAULT_SAMPLE_RATE, DEFAULT_SAMPLE_RATE)
-                return 0
+        import sounddevice as sd
+        # Reject an invalid microphone before importing/loading the model.
+        sd.check_input_settings(device=args.device, channels=1, dtype="float32", samplerate=DEFAULT_SAMPLE_RATE)
+        info = sd.query_devices(args.device, "input")
+        print(f"Microphone: {info['name']}", flush=True)
+        if args.check_mic:
+            run_live(None, args.device, DEFAULT_SAMPLE_RATE, DEFAULT_SAMPLE_RATE)
+            return 0
         diarizer = load_diarizer(None if args.no_transcript else args.stt_model,
                                 None if args.language == "auto" else args.language,
                                 nurse_patient=args.nurse_patient, holdback=args.holdback,
@@ -544,10 +514,7 @@ def main(argv: list[str] | None = None) -> int:
             print("Nurse/patient mode: learning two voices during the conversation; no setup. "
                   "Roles use English phrase rules and remain estimates; unclear voices/roles are UNKNOWN.",
                   flush=True)
-        if args.wav is not None:
-            run_wav(args.wav, diarizer, window, step)
-        else:
-            run_live(diarizer, args.device, window, step)
+        run_live(diarizer, args.device, window, step)
         return 0
     except KeyboardInterrupt:
         print("\nStopped. Microphone closed.", flush=True)
