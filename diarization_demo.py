@@ -14,20 +14,45 @@ import numpy as np
 from sim.audio import DEFAULT_SAMPLE_RATE
 from sim.speech_to_text import DEFAULT_STT_MODEL
 
+# Reading guide: main() selects options and loads models, then run_live() captures
+# microphone samples into RollingAudio. Diarizer.process() analyzes a snapshot,
+# matches speaker IDs, and joins speaker turns with Whisper word timestamps.
+#
+# Three separate questions are handled here:
+#   1. Pyannote: when is each voice speaking in this audio window?
+#   2. VoiceTracker: which session voice does each window-local voice resemble?
+#   3. Whisper: what words were spoken, and when?
+# ConversationRoles is an optional fourth step based on English text rules.
+# No LLM runs here, and no decision about when an assistant should speak is made.
+#
+# Audio is mono float32 at DEFAULT_SAMPLE_RATE (16,000 samples per second).
+# Model timestamps start at zero within each window; printed timestamps refer to
+# the microphone session. A turn is (start_seconds, end_seconds, speaker_label).
+
+# This is a pretrained pipeline, not a model trained or fine-tuned by this demo.
 MODEL = "pyannote/speaker-diarization-community-1"
 
 
 class VoiceTracker:
-    """Learn at most two session voice profiles, without a setup recording."""
+    """Match window-local speakers to at most two session voice profiles.
+
+    An embedding is a numeric description of voice characteristics. Profiles are
+    normalized embeddings kept only in memory for this run. SPEAKER_00 means the
+    first profile created, not necessarily the nurse or the first person heard.
+    Matching uses acoustic similarity; transcript words do not affect it.
+    """
 
     def __init__(self):
         self.profiles: list[np.ndarray] = []
 
     def assign(self, output, turns) -> dict[str, str]:
+        """Return local-label -> session-label matches, leaving doubts UNKNOWN."""
         # Pyannote documents embeddings in speaker_diarization.labels() order.
+        # Use that order rather than assuming labels encode embedding row numbers.
         labels = output.speaker_diarization.labels()
         mapping = {label: "SPEAKER_UNKNOWN" for label in labels}
         embeddings = output.speaker_embeddings
+        # A bad/missing embedding should not force a potentially incorrect identity.
         if embeddings is None or embeddings.ndim != 2 or len(embeddings) != len(labels):
             return mapping
         durations = {label: sum(b - a for a, b, speaker in turns if speaker == label)
@@ -39,9 +64,15 @@ class VoiceTracker:
             norm = np.linalg.norm(vector)
             if not np.isfinite(vector).all() or norm < 1e-8:
                 continue
+            # Unit-length vectors make their dot product equal cosine similarity.
+            # Larger scores mean greater similarity, not a probability of identity.
             vector = vector / norm
             scores = np.array([np.dot(vector, profile) for profile in self.profiles])
             # These cosine thresholds are demo heuristics, not calibrated probabilities.
+            # Create a profile only with >= 1 second of accumulated speech in this
+            # window and low similarity to all profiles already learned. The gap
+            # between creation (< .50) and matching (>= .60) deliberately permits
+            # UNKNOWN instead of making every voice fit one of the two profiles.
             if len(self.profiles) < 2 and durations[label] >= 1.0 and (
                 not len(scores) or scores.max() < 0.50
             ):
@@ -49,23 +80,41 @@ class VoiceTracker:
                 self.profiles.append(vector.copy())
             elif len(scores):
                 match = int(scores.argmax())
+                # With two profiles, demand separation from the other candidate.
+                # With only one, there is no competitor; use a fixed margin of 1.
                 margin = float(scores[match] - np.min(scores)) if len(scores) == 2 else 1.0
                 if scores[match] < 0.60 or margin < 0.10:
                     continue
                 # Adapt slowly, only on stronger matches with enough speech.
+                # Retain 95% of the profile to limit drift from a mistaken match,
+                # then normalize again before future cosine comparisons.
                 if scores[match] >= 0.75 and margin >= 0.20 and durations[label] >= 1.0:
                     profile = 0.95 * self.profiles[match] + 0.05 * vector
                     self.profiles[match] = profile / np.linalg.norm(profile)
             else:
                 continue
-            # Multiple local clusters may match the same actual person.
+            # Multiple local clusters may match the same actual person. Forcing
+            # distinct IDs here could turn two fragments of one voice into two
+            # people. Conversely, a wrong model grouping cannot be fixed reliably
+            # by this matching step alone.
             mapping[label] = f"SPEAKER_{match:02d}"
         return mapping
 
 
 class ConversationRoles:
-    """Conservative English phrase rules; roles remain explicit estimates."""
+    """Optionally estimate nurse/patient roles after acoustic speaker matching.
 
+    These regular expressions look for phrases about care or personal symptoms.
+    They do not recognize names, verify professions, or change speaker embeddings.
+    Role errors and diarization errors are separate; --track-speakers skips roles.
+    """
+
+    # Each pattern contributes at most one piece of evidence per speaker during
+    # the session. Repeating a common phrase therefore does not inflate its score.
+    # In these regexes, \b marks a word boundary, (?:...) groups alternatives,
+    # and [^.!?]{0,90} permits a bounded amount of text within a sentence.
+    # Nurse cues describe assessment/advice; patient cues describe own symptoms.
+    # These manually chosen phrases will miss valid wording and can be ambiguous.
     NURSE_CUES = (
         r"\b(?:i(?:'ll| will)|let me|we(?:'ll| will)) (?:need to )?(?:check|take|measure|examine)\b",
         r"\b(?:have you|are you|do you|did you|how long have you|when did you)\b[^.!?]{0,90}\b(?:symptoms|fever|pain|cough|medication|allergies|feeling|experienced|taken)\b",
@@ -89,10 +138,13 @@ class ConversationRoles:
         self.roles: dict[str, str] = {}
 
     def observe(self, lines) -> bool:
+        """Update accumulated cue evidence; return whether role estimates changed."""
         for a, b, label, text in lines:
             if label not in self.evidence:
                 continue
             old_end, tail = self.tails.get(label, (-float("inf"), ""))
+            # Window updates can cut a phrase in half. Join a short unfinished
+            # tail only when this speaker's next printed line is close in time.
             text = ((tail + " ") if a - old_end <= 1.5 else "") + text.lower().replace("’", "'")
             self.tails[label] = (b, re.split(r"[.!?]", text)[-1][-160:])
             nurse = {i for i, rule in enumerate(self.NURSE_CUES) if re.search(rule, text)}
@@ -104,6 +156,9 @@ class ConversationRoles:
         scores = {label: len(nurse) - len(patient)
                   for label, (nurse, patient) in self.evidence.items()}
         roles = {}
+        # Require complementary evidence for BOTH voices: a nurse score >= 2 and
+        # a patient score <= -2. Otherwise keep the roles unknown. New evidence
+        # can clear or change an earlier estimate; already printed lines stay as-is.
         if scores["SPEAKER_00"] >= 2 and scores["SPEAKER_01"] <= -2:
             roles = {"SPEAKER_00": "NURSE", "SPEAKER_01": "PATIENT"}
         elif scores["SPEAKER_01"] >= 2 and scores["SPEAKER_00"] <= -2:
@@ -113,18 +168,25 @@ class ConversationRoles:
         return changed
 
     def describe(self, label: str) -> str:
+        """Format an optional role while keeping its estimated status visible."""
         role = self.roles.get(label)
         return f"{label} [{role}, estimated]" if role else f"{label} [ROLE_UNKNOWN]"
 
 
 def timestamp(seconds: float) -> str:
+    """Format session-relative seconds as MM:SS.mmm; clamp negatives to zero."""
     milliseconds = round(max(0.0, seconds) * 1000)
     minutes, remainder = divmod(milliseconds, 60_000)
     return f"{minutes:02d}:{remainder // 1000:02d}.{remainder % 1000:03d}"
 
 
 class Diarizer:
-    """Process rolling microphone windows and emit speaker turns and text."""
+    """Analyze snapshots while retaining only the state needed across windows.
+
+    The pipeline and optional Whisper model are loaded once and reused. Previous
+    turns support label alignment; emitted_until marks the finalized output time.
+    Overlapping audio is analyzed again, but finalized output is not rewritten.
+    """
 
     def __init__(self, pipeline, torch, whisper=None, language: str | None = "en",
                  nurse_patient: bool = False, holdback: float = 0.0,
@@ -135,16 +197,30 @@ class Diarizer:
         self.language = language
         self.holdback = holdback
         self.inspect = inspect
+        # Times below are session-relative seconds, unlike the sample counters
+        # in RollingAudio. No full conversation audio is accumulated here.
         self.previous: list[tuple[float, float, str]] = []
         self.emitted_until = 0.0
         self.voices = VoiceTracker() if nurse_patient or track_speakers else None
+        # Inspection reports acoustic turns and STT independently, without roles.
         self.roles = ConversationRoles() if nurse_patient and not inspect else None
 
     def process(self, samples: np.ndarray, start: float, *, final: bool = False) -> None:
+        """Analyze one mono snapshot starting at session time ``start``.
+
+        ``final=True`` is used when stopping with holdback enabled: it releases
+        deferred output up to this snapshot's end instead of waiting for context.
+        """
         end = start + len(samples) / DEFAULT_SAMPLE_RATE
         # Revisit the newest speech with more context before printing it.
+        # Holdback delays output, not capture or inference. The maximum prevents
+        # the finalized time from moving backward on a shorter/overlapping update.
         emit_until = end if final else max(self.emitted_until, end - self.holdback)
         began = time.perf_counter()
+        # Gradients are unnecessary for inference. Add a channel dimension to
+        # turn a [samples] array into Pyannote's [channels, samples] tensor.
+        # Known limitation: exactly two speakers are requested in EVERY window,
+        # even when one person speaks alone. This can create artificial groups.
         with self.torch.inference_mode():
             output = self.pipeline(
                 {"waveform": self.torch.from_numpy(samples).unsqueeze(0),
@@ -156,10 +232,14 @@ class Diarizer:
             (max(start, start + turn.start), min(end, start + turn.end), speaker)
             for turn, _, speaker in output.speaker_diarization.itertracks(yield_label=True)
         ]
+        # Convert model-relative times to the session clock and clip to the
+        # snapshot boundaries. Keep local labels for inspection before remapping.
         local_turns = turns
         # Local cluster IDs can swap. Match the two possible assignments using
         # speech in the overlapping window. No enrollment or history of audio.
         def agreement(swap: bool) -> float:
+            # Score a candidate labeling by seconds of matching speech in the
+            # overlap with the previous snapshot. Used only without voice profiles.
             return sum(
                 max(0.0, min(b, old_b) - max(a, old_a))
                 for a, b, label in turns
@@ -178,8 +258,12 @@ class Diarizer:
             turns = [(a, b, mapping.get(speaker, "SPEAKER_UNKNOWN"))
                      for a, b, speaker in local_turns]
         elif agreement(True) > agreement(False):
+            # With two labels there are only two assignments: retain or swap.
+            # This temporal fallback has less identity evidence than voice profiles.
             turns = [(a, b, self.swap(label)) for a, b, label in turns]
         if start > self.emitted_until + 0.001:
+            # The ring buffer may overwrite audio while a slow inference runs.
+            # Make any resulting gap in finalized output explicit to the user.
             print(f"Warning: inference fell behind; skipped "
                   f"{timestamp(self.emitted_until)}-{timestamp(start)}.", file=sys.stderr)
         if self.inspect:
@@ -199,6 +283,8 @@ class Diarizer:
                     print(f"[STT {timestamp(max(start, self.emitted_until))}-{timestamp(emit_until)}] "
                           "(no text)", flush=True)
         elif self.whisper is not None and turns:
+            # Normal view joins words to speakers. Role estimation, if enabled,
+            # consumes those attributed lines rather than driving diarization.
             lines = self.transcribe(samples, start, turns, emit_until=emit_until)
             if self.roles is not None and self.roles.observe(lines):
                 description = "; ".join(f"{label}={role}" for label, role in self.roles.roles.items())
@@ -209,9 +295,13 @@ class Diarizer:
                 print(f"[{timestamp(a)}-{timestamp(b)}] {displayed}: {text}", flush=True)
             if not lines and any(min(b, emit_until) > max(a, self.emitted_until)
                                  for a, b, _ in turns):
+                # Speech turns and recognized words come from different models.
+                # This can mean empty STT or no words passing time/turn alignment;
+                # it does not mean the vocabulary has already appeared before.
                 print("Speech detected, but no new words recognized in this window.",
                       file=sys.stderr, flush=True)
         else:
+            # Speaker-only mode still clips to the newly finalized time interval.
             for a, b, label in turns:
                 a = max(a, self.emitted_until)
                 b = min(b, emit_until)
@@ -219,6 +309,9 @@ class Diarizer:
                     print(f"[{timestamp(a)}-{timestamp(b)}] {label}", flush=True)
         elapsed = time.perf_counter() - began
         rms = float(np.sqrt(np.mean(samples ** 2)))
+        # dBFS expresses signal level relative to full-scale amplitude 1.0.
+        # RMS measures average energy; peak (inspection only) measures the largest
+        # sample. The floor avoids log10(0) for a completely silent snapshot.
         level = 20 * np.log10(max(rms, 1e-12))
         if self.inspect:
             peak = 20 * np.log10(max(float(np.max(np.abs(samples))), 1e-12))
@@ -231,11 +324,21 @@ class Diarizer:
             details = f" (no speech; input {level:.0f} dBFS)" if not turns else ""
         print(f"Analyzed {timestamp(start)}-{timestamp(end)} in {elapsed:.2f}s"
               + details, file=sys.stdout if self.inspect else sys.stderr, flush=True)
+        # Normal diagnostics use stderr so stdout can be saved as a transcript.
+        # Retain whole-window turns for matching, but finalize only to emit_until.
         self.previous = turns
         self.emitted_until = emit_until
 
     def recognize(self, samples: np.ndarray, start: float, *, emit_until: float | None = None):
-        """Return timed words without using diarization to filter recognition."""
+        """Return (session_start, session_end, text) for newly eligible words.
+
+        This path does not require speaker turns, so inspection can show words
+        even where Pyannote misses speech. Whisper's own VAD and time filters
+        still apply; independent STT is not unfiltered recognition.
+        """
+        # Fast decoding and no previous-text conditioning keep each audio window
+        # independent. Whisper's VAD suppresses non-speech; word timestamps let us
+        # attach words to speakers later instead of guessing from whole sentences.
         segments, _ = self.whisper.transcribe(
             samples,
             language=self.language,
@@ -257,6 +360,8 @@ class Diarizer:
                 if b <= a or (a + b) / 2 < self.emitted_until:
                     continue
                 if emit_until is not None and (a + b) / 2 >= emit_until:
+                    # Defer this recent word; a future overlapping snapshot can
+                    # recognize and attribute it again with additional context.
                     continue
                 text = word.word.strip()
                 if text:
@@ -264,12 +369,20 @@ class Diarizer:
         return words
 
     def transcribe(self, samples: np.ndarray, start: float, turns, *, emit_until: float | None = None):
-        """Match each recognized word to its most-overlapping speaker turn."""
+        """Assign each eligible word to its most-overlapping speaker turn.
+
+        Called only with nonempty turns. Consecutive words assigned to the same
+        speaker are grouped for display, even across pauses. These printed lines
+        are convenient output groups, not guaranteed complete sentences or turns.
+        """
         lines: list[tuple[float, float, str, str]] = []
         for a, b, text in self.recognize(samples, start, emit_until=emit_until):
             turn = max(turns, key=lambda turn: max(0.0, min(b, turn[1]) - max(a, turn[0])))
             if min(b, turn[1]) <= max(a, turn[0]):
-                continue  # Do not label ASR hallucinations outside detected speech.
+                # Avoid assigning text to a speaker without detected speech there.
+                # This also drops real words when diarization misses their speech;
+                # inspection mode helps expose that disagreement.
+                continue
             a = max(a, self.emitted_until)
             label = turn[2]
             if lines and lines[-1][2] == label:
@@ -281,14 +394,22 @@ class Diarizer:
 
     @staticmethod
     def swap(label: str) -> str:
+        """Exchange the two local IDs for the overlap-based matching fallback."""
         return "SPEAKER_01" if label == "SPEAKER_00" else "SPEAKER_00"
 
 
 def load_diarizer(stt_model: str | None = DEFAULT_STT_MODEL, language: str | None = "en",
                  nurse_patient: bool = False, holdback: float = 0.0,
                  track_speakers: bool = False, inspect: bool = False) -> Diarizer:
+    """Load pretrained models once and assemble their per-session coordinator.
+
+    Passing stt_model=None skips Whisper. Heavy dependencies are imported here
+    so --help, --list-devices, and --check-mic do not load the neural models.
+    """
     import torch
 
+    # Only the diarization pipeline uses CUDA here. Without CUDA, including on
+    # macOS, it uses CPU; this demo does not select Apple's MPS GPU backend.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""),
           flush=True)
@@ -299,6 +420,8 @@ def load_diarizer(stt_model: str | None = DEFAULT_STT_MODEL, language: str | Non
         torch.cuda.synchronize()
         print(f"CUDA kernel check: passed; capability {torch.cuda.get_device_capability(0)}", flush=True)
     # Optional local .env convenience; an explicitly set environment wins.
+    # Read only HF_TOKEN, not the simulation's Ollama/TTS configuration. This is
+    # a small KEY=VALUE reader rather than a complete dotenv parser.
     if not os.environ.get("HF_TOKEN"):
         env_file = Path(__file__).with_name(".env")
         if env_file.exists():
@@ -308,6 +431,8 @@ def load_diarizer(stt_model: str | None = DEFAULT_STT_MODEL, language: str | Non
                     os.environ["HF_TOKEN"] = value.strip().strip("\"'")
                     break
     token = os.environ.get("HF_TOKEN", "").strip()
+    # These checks catch common setup mistakes locally. Actual access still
+    # depends on Hugging Face permissions and acceptance of the model conditions.
     if not token:
         raise RuntimeError("HF_TOKEN is not set. Set $env:HF_TOKEN or HF_TOKEN in the local .env file; "
                            "accept the model conditions at https://huggingface.co/" + MODEL)
@@ -319,12 +444,16 @@ def load_diarizer(stt_model: str | None = DEFAULT_STT_MODEL, language: str | Non
     # Microphone input is a tensor: the optional TorchCodec/FFmpeg decoder is unused.
     import warnings
     with warnings.catch_warnings():
+        # Suppress only the optional decoder warning during import. Other model
+        # warnings remain visible because they can help explain accuracy problems.
         warnings.filterwarnings("ignore", message=r"\s*torchcodec is not installed correctly.*")
         from pyannote.audio import Pipeline
 
     try:
         pipeline = Pipeline.from_pretrained(MODEL, token=token)
     except Exception as exc:
+        # Loading errors may contain request details. Redact the supplied token
+        # before putting the error into terminal output or a captured log.
         detail = str(exc).replace(token, "[REDACTED]")
         raise RuntimeError(f"Model loading failed ({type(exc).__name__}): {detail}\n"
                            "Check the demo requirements, internet access, "
@@ -342,44 +471,68 @@ def load_diarizer(stt_model: str | None = DEFAULT_STT_MODEL, language: str | Non
         print(f"Transcription: {stt_model}, CPU int8, language={language or 'auto'} "
               "(first run downloads Whisper weights)...", flush=True)
         whisper = _load_model(stt_model)
+    # Reuse the application's loader, but keep timestamped recognition and
+    # speaker alignment in this demo; the app's plain-text STT path is unchanged.
     return Diarizer(pipeline, torch, whisper, language, nurse_patient=nurse_patient, holdback=holdback,
                     track_speakers=track_speakers, inspect=inspect)
 
 
 class RollingAudio:
-    """Fixed storage: capture overwrites old audio while inference is busy."""
+    """A bounded circular buffer shared by capture and the processing loop.
+
+    The microphone callback writes new samples while model inference runs in the
+    main thread. Only the most recent ``capacity`` samples are retained. A lock
+    keeps writes and snapshot copies from observing partially updated storage.
+    """
 
     def __init__(self, capacity: int):
+        # capacity and position are sample counts, not seconds. position is the
+        # next write location; total counts ALL samples captured since startup,
+        # including samples already overwritten, so session time stays continuous.
         self.data = np.empty(capacity, dtype=np.float32)
         self.position = 0
         self.total = 0
         self.lock = threading.Lock()
 
     def append(self, samples: np.ndarray) -> None:
+        """Write a capture block, replacing the oldest audio when storage fills."""
         with self.lock:
             count = len(samples)
             self.total += count
             if count >= len(self.data):
+                # An unusually large callback can replace the whole buffer.
+                # Its newest capacity samples are sufficient for the next window.
                 self.data[:] = samples[-len(self.data):]
                 self.position = 0
                 return
             first = min(count, len(self.data) - self.position)
+            # A write crossing the physical end continues at index zero. Modulo
+            # moves the next write position back into the fixed storage range.
             self.data[self.position:self.position + first] = samples[:first]
             self.data[:count - first] = samples[first:]
             self.position = (self.position + count) % len(self.data)
 
     def snapshot(self, minimum_total: int) -> tuple[np.ndarray, int] | None:
+        """Copy retained audio in time order once enough samples have arrived.
+
+        Return (samples, total_captured) or None while waiting. The independent
+        copy lets capture overwrite the ring safely while inference uses it.
+        """
         with self.lock:
             if self.total < minimum_total:
                 return None
             if self.total < len(self.data):
+                # Before the buffer fills, its unused tail is uninitialized.
                 samples = self.data[:self.total].copy()
             else:
+                # Once full, the next write location is also the oldest sample.
+                # Join the two physical slices to restore chronological order.
                 samples = np.concatenate((self.data[self.position:], self.data[:self.position]))
             return samples, self.total
 
 
 def list_devices() -> None:
+    """List available input devices; output-only devices cannot be microphones."""
     import sounddevice as sd
 
     default = sd.default.device[0]
@@ -391,6 +544,11 @@ def list_devices() -> None:
 
 
 def run_live(diarizer: Diarizer | None, device: int | None, window: int, step: int) -> None:
+    """Capture continuously and analyze snapshots, or run a ten-second mic check.
+
+    window and step are integer SAMPLE counts, converted from CLI seconds in
+    main(). diarizer=None selects the levels-only check without loading models.
+    """
     import sounddevice as sd
 
     audio = RollingAudio(window)
@@ -398,6 +556,10 @@ def run_live(diarizer: Diarizer | None, device: int | None, window: int, step: i
     last_capture = time.monotonic()
 
     def capture(indata, frames, time_info, status):
+        # sounddevice invokes this callback on its capture thread. Keep model
+        # inference and printing in the main loop so they do not block capture.
+        # indata has shape [frames, channels]; only the requested mono channel
+        # is stored. Callback failures are reported to the main loop via state.
         nonlocal capture_error, last_capture
         del frames, time_info
         if status:
@@ -410,7 +572,7 @@ def run_live(diarizer: Diarizer | None, device: int | None, window: int, step: i
         samplerate=DEFAULT_SAMPLE_RATE,
         channels=1,
         dtype="float32",
-        blocksize=DEFAULT_SAMPLE_RATE // 10,
+        blocksize=DEFAULT_SAMPLE_RATE // 10,  # About 100 ms per callback.
         device=device,
         callback=capture,
     ) as stream:
@@ -423,19 +585,25 @@ def run_live(diarizer: Diarizer | None, device: int | None, window: int, step: i
             if diarizer.holdback:
                 print(f"Finalization holdback: {diarizer.holdback:g}s; "
                       "Ctrl+C finalizes buffered audio before closing.", flush=True)
+        # Wait for the first full window before inference. In microphone-check
+        # mode both window and step are one second, giving one levels update/sec.
         next_sample = window
         try:
             while True:
                 if capture_error or not stream.active:
                     raise RuntimeError(f"Microphone stream stopped: {capture_error or 'device disconnected'}")
                 if time.monotonic() - last_capture > 5:
+                    # Distinguish a stalled stream from valid but silent audio.
                     raise RuntimeError("Microphone stopped delivering audio. Check the selected input device.")
                 snapshot = audio.snapshot(next_sample)
                 if snapshot is None:
+                    # Short waits keep Ctrl+C responsive without a busy loop.
                     time.sleep(0.05)
                     continue
                 samples, total = snapshot
                 if diarizer is None:
+                    # Levels diagnose whether the selected input actually carries
+                    # audio. They do not establish whether speech is intelligible.
                     rms = float(np.sqrt(np.mean(samples ** 2)))
                     peak = float(np.max(np.abs(samples)))
                     level = 20 * np.log10(max(rms, 1e-12))
@@ -447,34 +615,56 @@ def run_live(diarizer: Diarizer | None, device: int | None, window: int, step: i
                         print("Microphone check complete. Microphone closed.", flush=True)
                         return
                 else:
+                    # Derive the snapshot's session start from captured samples,
+                    # not wall-clock time spent loading models or doing inference.
                     diarizer.process(samples, (total - len(samples)) / DEFAULT_SAMPLE_RATE)
+                # Request at least step NEW samples beyond this snapshot. Capture
+                # continues during inference, so updates may cover more than step
+                # seconds and are not guaranteed to arrive on an exact schedule.
                 next_sample = total + step
         except KeyboardInterrupt:
             if diarizer is not None and diarizer.holdback:
+                # Freeze capture before the final snapshot so the buffered tail
+                # has a fixed end. final=True releases the holdback interval.
                 stream.stop()
                 snapshot = audio.snapshot(1)
                 if snapshot is not None:
                     samples, total = snapshot
                     print("Finalizing buffered audio...", flush=True)
                     diarizer.process(samples, (total - len(samples)) / DEFAULT_SAMPLE_RATE, final=True)
+            # The stream context closes the device; main() prints the stop message.
+            # With zero holdback, stopping does not run another inference pass.
             raise
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Validate CLI options, prepare the input/models, and run until stopped.
+
+    main.py --diarization dispatches here after removing its mode-selection flag.
+    Return 0 for completion/user stop and 1 for a runtime failure. argparse handles
+    --help and invalid arguments with its own exit statuses before capture starts.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
+    # Device diagnostics come first so setup can be checked without model access.
     parser.add_argument("--list-devices", action="store_true", help="List microphone IDs; no model/token needed.")
     parser.add_argument("--device", type=int, help="Input device ID (default: system microphone).")
     parser.add_argument("--check-mic", action="store_true",
                         help="Show microphone levels for 10 seconds without loading models or using HF_TOKEN.")
+    # window controls how much recent context is analyzed. step controls how much
+    # new audio is required before the next snapshot. holdback delays final output.
     parser.add_argument("--window", type=float, default=6.0, help="Analysis window seconds (default: 6).")
     parser.add_argument("--step", type=float, default=3.0, help="Analysis interval seconds (default: 3).")
     parser.add_argument("--holdback", type=float, default=0.0,
                         help="Wait for more context before finalizing labels, in seconds (default: 0).")
+    # STT can be disabled independently. English-only .en models cannot transcribe
+    # other languages; use a multilingual Whisper model with a different language.
     parser.add_argument("--no-transcript", action="store_true", help="Print speaker labels only; do not load Whisper.")
     parser.add_argument("--stt-model", default=DEFAULT_STT_MODEL, help="Whisper model (default: tiny.en; base.en for better English accuracy).")
     parser.add_argument("--language", default="en", help="Speech language code (default: en; use auto to detect).")
     parser.add_argument("--nurse-patient", action="store_true",
                         help="Learn two voices without setup; estimate English nurse/patient roles.")
+    # Session tracking does not require role inference. Inspection separates model
+    # outputs so a missing transcript line is not mistaken for missing speaker turns.
     parser.add_argument("--track-speakers", action="store_true",
                         help="Keep session voice IDs across windows without estimating roles.")
     parser.add_argument("--inspect", action="store_true",
@@ -483,8 +673,10 @@ def main(argv: list[str] | None = None) -> int:
     if not (0 < args.step <= args.window < float("inf")):
         parser.error("Require 0 < --step <= --window, with finite durations.")
     if not 0 <= args.holdback <= args.window - args.step:
+        # After the next update, deferred audio must still fit in the ring buffer.
         parser.error("Require 0 <= --holdback <= --window minus --step so deferred audio stays in the buffer.")
     window, step = (round(value * DEFAULT_SAMPLE_RATE) for value in (args.window, args.step))
+    # The CLI uses seconds; the stream/buffer operate on whole samples.
     if not step:
         parser.error("--step must be at least one sample.")
     if not args.no_transcript and args.stt_model.endswith(".en") and args.language not in ("en", "auto"):
@@ -501,6 +693,7 @@ def main(argv: list[str] | None = None) -> int:
         info = sd.query_devices(args.device, "input")
         print(f"Microphone: {info['name']}", flush=True)
         if args.check_mic:
+            # One-second snapshots for ten seconds, without touching either model.
             run_live(None, args.device, DEFAULT_SAMPLE_RATE, DEFAULT_SAMPLE_RATE)
             return 0
         diarizer = load_diarizer(None if args.no_transcript else args.stt_model,
@@ -514,6 +707,7 @@ def main(argv: list[str] | None = None) -> int:
             print("Nurse/patient mode: learning two voices during the conversation; no setup. "
                   "Roles use English phrase rules and remain estimates; unclear voices/roles are UNKNOWN.",
                   flush=True)
+        # Models are ready before opening the long-running microphone stream.
         run_live(diarizer, args.device, window, step)
         return 0
     except KeyboardInterrupt:
@@ -525,4 +719,5 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # Preserve the same process exit status for direct and main.py launches.
     raise SystemExit(main())
