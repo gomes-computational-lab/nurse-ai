@@ -42,7 +42,7 @@ class DiarizationDemoTests(unittest.TestCase):
         ])
         self.assertEqual(diarizer.emitted_until, 9)
         for call in pipeline.call_args_list:
-            self.assertEqual(call.kwargs, {"min_speakers": 2, "max_speakers": 2})
+            self.assertEqual(call.kwargs, {"min_speakers": 1, "max_speakers": 2})
             self.assertEqual(call.args[0]["sample_rate"], 16000)
 
         # Exercise transcription without importing or downloading Whisper.

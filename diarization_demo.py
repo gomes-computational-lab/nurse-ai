@@ -147,7 +147,7 @@ class Diarizer:
             output = self.pipeline(
                 {"waveform": self.torch.from_numpy(samples).unsqueeze(0),
                  "sample_rate": DEFAULT_SAMPLE_RATE},
-                min_speakers=2,
+                min_speakers=1,
                 max_speakers=2,
             )
         turns = [
