@@ -247,8 +247,8 @@ The most useful metrics are:
 
 The standalone [diarization demo](demos/diarization/README.md) listens to two speakers
 and prints timestamps, speaker IDs, and local Whisper transcription. It also supports
-WAV replay, independent speaker/STT inspection, optional nurse/patient role estimates,
-and a transcript comparison helper. It does not require Ollama.
+WAV replay, independent speaker/STT inspection, and optional nurse/patient role
+estimates. It does not require Ollama.
 
 Install it in its own environment using the linked guide; its Pyannote/PyTorch
 dependencies are separate from the simulation requirements. Windows CUDA has been

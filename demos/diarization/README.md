@@ -155,30 +155,6 @@ zero. Require `0 <= holdback <= window - step`. WAV mode flushes the final inter
 With positive holdback, live Ctrl+C closes capture and processes the buffered tail
 before exiting, which can take a few seconds. Zero holdback does not flush that tail.
 
-## Reference transcript comparison
-
-Create a local reference using `Nurse:` and `Patient:` turns, for example:
-
-```text
-Nurse: Good morning. How are you feeling?
-Patient: I feel better today.
-```
-
-Save normal timestamped speaker/text output with the logging command above, then:
-
-```bash
-python demos/diarization/evaluate_transcript.py --reference path/to/reference.txt --prediction transcripts/diarization.txt --output transcripts/score.json
-```
-
-The helper aligns exact normalized words and chooses one global speaker-ID mapping.
-It reports lexical coverage and correct, wrong, and unknown speaker attribution
-for matched words, including separate results for each speaker. Check coverage
-alongside accuracy: missing or misrecognized words are excluded from attribution's
-denominator. This is neither time-based diarization error rate (DER) nor word error
-rate (WER). Inspection-format logs are unsupported. UTF-8 and PowerShell UTF-16 logs
-are supported. Local references under `demos/diarization/references/` and generated
-logs under `transcripts/` are ignored by Git.
-
 ## Limitations and checks
 
 The pipeline requests exactly two speakers **in every window**, including windows
@@ -194,5 +170,5 @@ python -m unittest discover -s tests -p 'test_diarization*.py' -v
 ```
 
 Tests cover label alignment, voice matching, word attribution, independent inspection,
-delayed finalization, and reference scoring using mocked model outputs. Live accuracy
-and performance require representative recordings.
+and delayed finalization using mocked model outputs. Live accuracy and performance
+require representative recordings.
