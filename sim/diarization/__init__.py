@@ -34,6 +34,11 @@ from .providers import (
     load_whisper_provider,
 )
 from .tracking import UNKNOWN_SPEAKER_ID, VoiceTracker
+from .service import (
+    DiarizationService,
+    DiarizationServiceClosedError,
+    DiarizationServiceError,
+)
 
 __all__ = [
     "AudioGap",
@@ -42,6 +47,9 @@ __all__ = [
     "DiarizationConfig",
     "DiarizationFrame",
     "DiarizationProvider",
+    "DiarizationService",
+    "DiarizationServiceClosedError",
+    "DiarizationServiceError",
     "LocalSpeakerTurn",
     "ProcessingDiagnostics",
     "ProcessingResult",

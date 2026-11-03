@@ -27,6 +27,12 @@ class VoiceTracker:
     def profile_count(self) -> int:
         return len(self._profiles)
 
+    def clone(self) -> VoiceTracker:
+        """Copy tracker state so a processing update can commit atomically."""
+        tracker = VoiceTracker(self.config)
+        tracker._profiles = [profile.copy() for profile in self._profiles]
+        return tracker
+
     def assign(self, frame: DiarizationFrame) -> dict[str, str]:
         """Map local acoustic labels to session IDs, leaving ambiguity unknown."""
         labels = frame.speaker_labels
