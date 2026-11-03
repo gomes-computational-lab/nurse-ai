@@ -247,13 +247,13 @@ The most useful metrics are:
 
 The standalone [diarization demo](demos/diarization/README.md) listens to two speakers
 and prints timestamps, speaker IDs, and local Whisper transcription from a microphone.
-It also supports independent speaker/STT inspection and optional nurse/patient role
-estimates. It does not require Ollama.
+Voice tracking automatically matches speaker IDs across windows. Independent
+speaker/STT inspection helps diagnose errors. It does not require Ollama.
 
 Run it through the shared entry point using the demo's Python environment:
 
 ```bash
-python main.py --diarization --track-speakers --window 15 --step 3
+python main.py --diarization --window 15 --step 3
 ```
 
 Install it in its own environment using the linked guide; its Pyannote/PyTorch

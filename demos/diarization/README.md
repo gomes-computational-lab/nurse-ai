@@ -3,8 +3,8 @@
 `python main.py --diarization` prints timestamps, speaker IDs, and local Whisper text
 from a microphone. The implementation lives in `diarization_demo.py`,
 which can also be run directly. Pyannote Community-1 supplies speaker turns.
-Optional session voice profiles match IDs across windows. This standalone experiment
-does not call Ollama or decide when an LLM should speak.
+Session voice profiles automatically match IDs across windows. This standalone
+experiment does not call Ollama or decide when an LLM should speak.
 
 ## Installation
 
@@ -73,10 +73,10 @@ allow microphone access for Terminal or the app hosting the terminal. The check
 runs for ten seconds without models or a token. Nearly silent levels indicate an
 input, mute, permission, or positioning problem.
 
-For timestamps, speaker IDs, and text without estimated roles:
+For timestamps, tracked speaker IDs, and text:
 
 ```bash
-python main.py --diarization --track-speakers --window 15 --step 3
+python main.py --diarization --window 15 --step 3
 ```
 
 Illustrative output:
@@ -93,18 +93,16 @@ seconds, so specify fifteen explicitly to reproduce these commands. Capture
 continues during inference; losing audio when processing falls behind produces a
 gap warning. Raw microphone audio is not saved.
 
-`--track-speakers` learns up to two voice profiles for the current run. IDs have no
-role meaning; uncertain matches appear as `SPEAKER_UNKNOWN`. Without this flag,
-labels are aligned using overlap between neighboring windows. Use `--nurse-patient`
-instead for tracking plus English phrase-based role estimates. These optional
-estimates do not establish a person's identity.
+The demo automatically learns up to two voice profiles for the current run. IDs
+have no role meaning; uncertain matches appear as `SPEAKER_UNKNOWN`. The IDs track
+acoustic voices without estimating which person is a nurse or patient.
 
 Stop with Ctrl+C. To save normal output in PowerShell:
 
 ```powershell
 New-Item -ItemType Directory -Force .\transcripts | Out-Null
 $log = ".\transcripts\diarization-$(Get-Date -Format yyyyMMdd-HHmmss).txt"
-.\.venv\diarization\Scripts\python.exe .\main.py --diarization --track-speakers --window 15 --step 3 |
+.\.venv\diarization\Scripts\python.exe .\main.py --diarization --window 15 --step 3 |
     Tee-Object -FilePath $log
 ```
 
@@ -115,13 +113,12 @@ For only timestamped speaker/text lines, append
 ## Inspect diarization and STT separately
 
 ```bash
-python main.py --diarization --track-speakers --window 15 --step 3 --inspect
+python main.py --diarization --window 15 --step 3 --inspect
 ```
 
 Inspection prints `[TURN ...] SPEAKER_00 (model=SPEAKER_01)` intervals and independent
 `[STT ...]` text, plus input levels and speaker/profile counts. `model=` is the local
 Pyannote label, which can change between windows; the main ID is the session label.
-Roles are disabled in this view.
 
 Normal output assigns recognized words to their most-overlapping speaker turn and
 discards words outside detected turns. Inspection keeps STT independent of those

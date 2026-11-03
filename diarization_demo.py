@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
-import re
 import sys
 import threading
 import time
@@ -22,7 +21,6 @@ from sim.speech_to_text import DEFAULT_STT_MODEL
 #   1. Pyannote: when is each voice speaking in this audio window?
 #   2. VoiceTracker: which session voice does each window-local voice resemble?
 #   3. Whisper: what words were spoken, and when?
-# ConversationRoles is an optional fourth step based on English text rules.
 # No LLM runs here, and no decision about when an assistant should speak is made.
 #
 # Audio is mono float32 at DEFAULT_SAMPLE_RATE (16,000 samples per second).
@@ -101,78 +99,6 @@ class VoiceTracker:
         return mapping
 
 
-class ConversationRoles:
-    """Optionally estimate nurse/patient roles after acoustic speaker matching.
-
-    These regular expressions look for phrases about care or personal symptoms.
-    They do not recognize names, verify professions, or change speaker embeddings.
-    Role errors and diarization errors are separate; --track-speakers skips roles.
-    """
-
-    # Each pattern contributes at most one piece of evidence per speaker during
-    # the session. Repeating a common phrase therefore does not inflate its score.
-    # In these regexes, \b marks a word boundary, (?:...) groups alternatives,
-    # and [^.!?]{0,90} permits a bounded amount of text within a sentence.
-    # Nurse cues describe assessment/advice; patient cues describe own symptoms.
-    # These manually chosen phrases will miss valid wording and can be ambiguous.
-    NURSE_CUES = (
-        r"\b(?:i(?:'ll| will)|let me|we(?:'ll| will)) (?:need to )?(?:check|take|measure|examine)\b",
-        r"\b(?:have you|are you|do you|did you|how long have you|when did you)\b[^.!?]{0,90}\b(?:symptoms|fever|pain|cough|medication|allergies|feeling|experienced|taken)\b",
-        r"\b(?:your (?:blood pressure|temperature|pulse|vital signs)|roll up your sleeve)\b",
-        r"\b(?:you (?:should|need to|must)|make sure you|try to)\b[^.!?]{0,50}\b(?:rest|drink|stay hydrated|take|avoid|monitor)\b",
-        r"\bi(?:'ll| will) (?:inform|notify) (?:the |your )?(?:doctor|physician)\b",
-    )
-    PATIENT_CUES = (
-        r"\bi(?:'m| am) (?:not feeling well|feeling (?:sick|unwell|tired)|in pain)\b",
-        r"\bi(?:'ve| have) (?:also )?(?:had|been)\b[^.!?]{0,50}\b(?:headache|fever|cough|coughing|vomiting|pain|dizzy)\b",
-        r"\bmy (?:head|stomach|chest|back|throat|shoulder) (?:hurts|aches|is sore)\b",
-        r"\b(?:i feel (?:very )?(?:tired|dizzy|sick|weak|unwell)|i(?:'m| am) (?:coughing|vomiting|nauseous))\b",
-        r"\bi (?:took|have taken)\b[^.!?]{0,40}\b(?:painkillers|medication|medicine|ibuprofen|paracetamol|aspirin)\b",
-        r"\b(?:is it serious|should i be worried|do i need to (?:stay|take)|do you think i need)\b",
-    )
-
-    def __init__(self):
-        # Two small sets of cue IDs per voice, plus at most 160 trailing characters.
-        self.evidence = {label: (set(), set()) for label in ("SPEAKER_00", "SPEAKER_01")}
-        self.tails: dict[str, tuple[float, str]] = {}
-        self.roles: dict[str, str] = {}
-
-    def observe(self, lines) -> bool:
-        """Update accumulated cue evidence; return whether role estimates changed."""
-        for a, b, label, text in lines:
-            if label not in self.evidence:
-                continue
-            old_end, tail = self.tails.get(label, (-float("inf"), ""))
-            # Window updates can cut a phrase in half. Join a short unfinished
-            # tail only when this speaker's next printed line is close in time.
-            text = ((tail + " ") if a - old_end <= 1.5 else "") + text.lower().replace("’", "'")
-            self.tails[label] = (b, re.split(r"[.!?]", text)[-1][-160:])
-            nurse = {i for i, rule in enumerate(self.NURSE_CUES) if re.search(rule, text)}
-            patient = {i for i, rule in enumerate(self.PATIENT_CUES) if re.search(rule, text)}
-            if nurse and patient:
-                continue  # A merged/mixed-role line is unsafe evidence for either role.
-            self.evidence[label][0].update(nurse)
-            self.evidence[label][1].update(patient)
-        scores = {label: len(nurse) - len(patient)
-                  for label, (nurse, patient) in self.evidence.items()}
-        roles = {}
-        # Require complementary evidence for BOTH voices: a nurse score >= 2 and
-        # a patient score <= -2. Otherwise keep the roles unknown. New evidence
-        # can clear or change an earlier estimate; already printed lines stay as-is.
-        if scores["SPEAKER_00"] >= 2 and scores["SPEAKER_01"] <= -2:
-            roles = {"SPEAKER_00": "NURSE", "SPEAKER_01": "PATIENT"}
-        elif scores["SPEAKER_01"] >= 2 and scores["SPEAKER_00"] <= -2:
-            roles = {"SPEAKER_00": "PATIENT", "SPEAKER_01": "NURSE"}
-        changed = roles != self.roles
-        self.roles = roles
-        return changed
-
-    def describe(self, label: str) -> str:
-        """Format an optional role while keeping its estimated status visible."""
-        role = self.roles.get(label)
-        return f"{label} [{role}, estimated]" if role else f"{label} [ROLE_UNKNOWN]"
-
-
 def timestamp(seconds: float) -> str:
     """Format session-relative seconds as MM:SS.mmm; clamp negatives to zero."""
     milliseconds = round(max(0.0, seconds) * 1000)
@@ -183,14 +109,13 @@ def timestamp(seconds: float) -> str:
 class Diarizer:
     """Analyze snapshots while retaining only the state needed across windows.
 
-    The pipeline and optional Whisper model are loaded once and reused. Previous
-    turns support label alignment; emitted_until marks the finalized output time.
+    The pipeline and optional Whisper model are loaded once and reused. Voice
+    profiles retain identity; emitted_until marks the finalized output time.
     Overlapping audio is analyzed again, but finalized output is not rewritten.
     """
 
     def __init__(self, pipeline, torch, whisper=None, language: str | None = "en",
-                 nurse_patient: bool = False, holdback: float = 0.0,
-                 track_speakers: bool = False, inspect: bool = False):
+                 holdback: float = 0.0, inspect: bool = False):
         self.pipeline = pipeline
         self.torch = torch
         self.whisper = whisper
@@ -199,11 +124,8 @@ class Diarizer:
         self.inspect = inspect
         # Times below are session-relative seconds, unlike the sample counters
         # in RollingAudio. No full conversation audio is accumulated here.
-        self.previous: list[tuple[float, float, str]] = []
         self.emitted_until = 0.0
-        self.voices = VoiceTracker() if nurse_patient or track_speakers else None
-        # Inspection reports acoustic turns and STT independently, without roles.
-        self.roles = ConversationRoles() if nurse_patient and not inspect else None
+        self.voices = VoiceTracker()
 
     def process(self, samples: np.ndarray, start: float, *, final: bool = False) -> None:
         """Analyze one mono snapshot starting at session time ``start``.
@@ -232,35 +154,18 @@ class Diarizer:
             (max(start, start + turn.start), min(end, start + turn.end), speaker)
             for turn, _, speaker in output.speaker_diarization.itertracks(yield_label=True)
         ]
-        # Convert model-relative times to the session clock and clip to the
-        # snapshot boundaries. Keep local labels for inspection before remapping.
-        local_turns = turns
-        # Local cluster IDs can swap. Match the two possible assignments using
-        # speech in the overlapping window. No enrollment or history of audio.
-        def agreement(swap: bool) -> float:
-            # Score a candidate labeling by seconds of matching speech in the
-            # overlap with the previous snapshot. Used only without voice profiles.
-            return sum(
-                max(0.0, min(b, old_b) - max(a, old_a))
-                for a, b, label in turns
-                for old_a, old_b, old_label in self.previous
-                if (self.swap(label) if swap else label) == old_label
-            )
-
-        if self.voices is not None:
-            mapping = self.voices.assign(output, turns)
-            # Community-1's exclusive turns avoid choosing arbitrarily between
-            # simultaneous speakers when aligning a single recognized word.
-            local_turns = [
-                (max(start, start + turn.start), min(end, start + turn.end), speaker)
-                for turn, _, speaker in output.exclusive_speaker_diarization.itertracks(yield_label=True)
-            ]
-            turns = [(a, b, mapping.get(speaker, "SPEAKER_UNKNOWN"))
-                     for a, b, speaker in local_turns]
-        elif agreement(True) > agreement(False):
-            # With two labels there are only two assignments: retain or swap.
-            # This temporal fallback has less identity evidence than voice profiles.
-            turns = [(a, b, self.swap(label)) for a, b, label in turns]
+        # Voice profiles match local cluster IDs to session IDs automatically.
+        mapping = self.voices.assign(output, turns)
+        # Community-1's exclusive turns avoid choosing arbitrarily between
+        # simultaneous speakers when aligning a single recognized word.
+        local_turns = [
+            (max(start, start + turn.start), min(end, start + turn.end), speaker)
+            for turn, _, speaker in output.exclusive_speaker_diarization.itertracks(yield_label=True)
+        ]
+        # Both annotations use the session clock, clipped to snapshot boundaries.
+        # Keep local labels alongside tracked ones for the inspection display.
+        turns = [(a, b, mapping.get(speaker, "SPEAKER_UNKNOWN"))
+                 for a, b, speaker in local_turns]
         if start > self.emitted_until + 0.001:
             # The ring buffer may overwrite audio while a slow inference runs.
             # Make any resulting gap in finalized output explicit to the user.
@@ -283,16 +188,10 @@ class Diarizer:
                     print(f"[STT {timestamp(max(start, self.emitted_until))}-{timestamp(emit_until)}] "
                           "(no text)", flush=True)
         elif self.whisper is not None and turns:
-            # Normal view joins words to speakers. Role estimation, if enabled,
-            # consumes those attributed lines rather than driving diarization.
+            # Normal view joins recognized words to tracked session speakers.
             lines = self.transcribe(samples, start, turns, emit_until=emit_until)
-            if self.roles is not None and self.roles.observe(lines):
-                description = "; ".join(f"{label}={role}" for label, role in self.roles.roles.items())
-                print(f"Role estimate updated: {description or 'roles uncertain'}. "
-                      "Earlier lines are unchanged.", flush=True)
             for a, b, label, text in lines:
-                displayed = self.roles.describe(label) if self.roles is not None else label
-                print(f"[{timestamp(a)}-{timestamp(b)}] {displayed}: {text}", flush=True)
+                print(f"[{timestamp(a)}-{timestamp(b)}] {label}: {text}", flush=True)
             if not lines and any(min(b, emit_until) > max(a, self.emitted_until)
                                  for a, b, _ in turns):
                 # Speech turns and recognized words come from different models.
@@ -317,16 +216,14 @@ class Diarizer:
             peak = 20 * np.log10(max(float(np.max(np.abs(samples))), 1e-12))
             details = f"; input RMS {level:.0f} dBFS, peak {peak:.0f} dBFS"
             details += f"; model={len({speaker for _, _, speaker in local_turns})}"
-            if self.voices is not None:
-                known = {speaker for _, _, speaker in turns} - {"SPEAKER_UNKNOWN"}
-                details += f", tracked={len(known)}, profiles={len(self.voices.profiles)}/2"
+            known = {speaker for _, _, speaker in turns} - {"SPEAKER_UNKNOWN"}
+            details += f", tracked={len(known)}, profiles={len(self.voices.profiles)}/2"
         else:
             details = f" (no speech; input {level:.0f} dBFS)" if not turns else ""
         print(f"Analyzed {timestamp(start)}-{timestamp(end)} in {elapsed:.2f}s"
               + details, file=sys.stdout if self.inspect else sys.stderr, flush=True)
         # Normal diagnostics use stderr so stdout can be saved as a transcript.
-        # Retain whole-window turns for matching, but finalize only to emit_until.
-        self.previous = turns
+        # Finalize only to emit_until; deferred speech can be analyzed again.
         self.emitted_until = emit_until
 
     def recognize(self, samples: np.ndarray, start: float, *, emit_until: float | None = None):
@@ -392,15 +289,9 @@ class Diarizer:
                 lines.append((a, b, label, text))
         return lines
 
-    @staticmethod
-    def swap(label: str) -> str:
-        """Exchange the two local IDs for the overlap-based matching fallback."""
-        return "SPEAKER_01" if label == "SPEAKER_00" else "SPEAKER_00"
-
 
 def load_diarizer(stt_model: str | None = DEFAULT_STT_MODEL, language: str | None = "en",
-                 nurse_patient: bool = False, holdback: float = 0.0,
-                 track_speakers: bool = False, inspect: bool = False) -> Diarizer:
+                 holdback: float = 0.0, inspect: bool = False) -> Diarizer:
     """Load pretrained models once and assemble their per-session coordinator.
 
     Passing stt_model=None skips Whisper. Heavy dependencies are imported here
@@ -473,8 +364,7 @@ def load_diarizer(stt_model: str | None = DEFAULT_STT_MODEL, language: str | Non
         whisper = _load_model(stt_model)
     # Reuse the application's loader, but keep timestamped recognition and
     # speaker alignment in this demo; the app's plain-text STT path is unchanged.
-    return Diarizer(pipeline, torch, whisper, language, nurse_patient=nurse_patient, holdback=holdback,
-                    track_speakers=track_speakers, inspect=inspect)
+    return Diarizer(pipeline, torch, whisper, language, holdback=holdback, inspect=inspect)
 
 
 class RollingAudio:
@@ -661,14 +551,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-transcript", action="store_true", help="Print speaker labels only; do not load Whisper.")
     parser.add_argument("--stt-model", default=DEFAULT_STT_MODEL, help="Whisper model (default: tiny.en; base.en for better English accuracy).")
     parser.add_argument("--language", default="en", help="Speech language code (default: en; use auto to detect).")
-    parser.add_argument("--nurse-patient", action="store_true",
-                        help="Learn two voices without setup; estimate English nurse/patient roles.")
-    # Session tracking does not require role inference. Inspection separates model
-    # outputs so a missing transcript line is not mistaken for missing speaker turns.
-    parser.add_argument("--track-speakers", action="store_true",
-                        help="Keep session voice IDs across windows without estimating roles.")
+    # Inspection separates model outputs so missing STT is not mistaken for
+    # missing speaker turns. Session voice tracking is always enabled.
     parser.add_argument("--inspect", action="store_true",
-                        help="Print speaker turns, independent STT text, and input levels; omit roles.")
+                        help="Print speaker turns, independent STT text, and input levels.")
     args = parser.parse_args(argv)
     if not (0 < args.step <= args.window < float("inf")):
         parser.error("Require 0 < --step <= --window, with finite durations.")
@@ -681,8 +567,6 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--step must be at least one sample.")
     if not args.no_transcript and args.stt_model.endswith(".en") and args.language not in ("en", "auto"):
         parser.error("For other languages, use a multilingual model, e.g. --stt-model tiny --language pt.")
-    if args.nurse_patient and (args.no_transcript or args.language != "en"):
-        parser.error("--nurse-patient requires English transcription (--language en, without --no-transcript).")
     try:
         if args.list_devices:
             list_devices()
@@ -698,15 +582,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         diarizer = load_diarizer(None if args.no_transcript else args.stt_model,
                                 None if args.language == "auto" else args.language,
-                                nurse_patient=args.nurse_patient, holdback=args.holdback,
-                                track_speakers=args.track_speakers, inspect=args.inspect)
+                                holdback=args.holdback, inspect=args.inspect)
         if args.inspect:
             print("Inspection: TURN shows speaker intervals and local model IDs; "
-                  "STT shows recognized text independently. Roles are disabled.", flush=True)
-        elif args.nurse_patient:
-            print("Nurse/patient mode: learning two voices during the conversation; no setup. "
-                  "Roles use English phrase rules and remain estimates; unclear voices/roles are UNKNOWN.",
-                  flush=True)
+                  "STT shows recognized text independently.", flush=True)
         # Models are ready before opening the long-running microphone stream.
         run_live(diarizer, args.device, window, step)
         return 0

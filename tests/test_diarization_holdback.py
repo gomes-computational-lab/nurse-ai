@@ -60,7 +60,10 @@ class HoldbackTests(unittest.TestCase):
     def test_labels_without_transcription_are_held_and_flushed(self):
         annotation = Mock()
         annotation.itertracks.return_value = [(SimpleNamespace(start=0, end=6), 0, 'SPEAKER_00')]
-        pipeline = Mock(return_value=SimpleNamespace(speaker_diarization=annotation))
+        annotation.labels.return_value = ['SPEAKER_00']
+        pipeline = Mock(return_value=SimpleNamespace(
+            speaker_diarization=annotation, exclusive_speaker_diarization=annotation,
+            speaker_embeddings=np.array([[1, 0]], dtype=float)))
         torch = Mock()
         torch.inference_mode.side_effect = nullcontext
         diarizer = Diarizer(pipeline, torch, holdback=3)

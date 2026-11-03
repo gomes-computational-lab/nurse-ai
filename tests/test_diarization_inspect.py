@@ -30,8 +30,7 @@ class InspectionTests(unittest.TestCase):
         torch.inference_mode.side_effect = nullcontext
         whisper = Mock()
         whisper.transcribe.return_value = transcript
-        diarizer = Diarizer(Mock(return_value=output), torch, whisper,
-                            track_speakers=True, **kwargs)
+        diarizer = Diarizer(Mock(return_value=output), torch, whisper, **kwargs)
         return diarizer
 
     def capture(self, diarizer, start=0):
@@ -69,12 +68,11 @@ class InspectionTests(unittest.TestCase):
         self.assertIn('[TURN 00:00.000-00:01.000]', stdout)
         self.assertIn('[STT 00:02.000-00:03.000] Outside the turn.', stdout)
 
-    def test_tracking_without_roles_keeps_the_combined_transcript_format(self):
+    def test_automatic_tracking_keeps_the_combined_transcript_format(self):
         diarizer = self.make_diarizer(model_output([(0, 6, 'SPEAKER_00')], [[1, 0]]),
                                     recognized([(1, 2, 'Hello.')]))
         stdout, _ = self.capture(diarizer)
         self.assertIsNotNone(diarizer.voices)
-        self.assertIsNone(diarizer.roles)
         self.assertEqual(stdout, '[00:01.000-00:02.000] SPEAKER_00: Hello.\n')
 
     def test_repeated_words_in_later_audio_are_still_printed(self):
