@@ -126,23 +126,15 @@ turns to distinguish transcription failures from segmentation or matching failur
 "Speech detected, but no new words recognized" means no aligned words were ready
 to print in the newly emitted time interval. Repeated vocabulary is not removed.
 
-Use `--no-transcript` for intervals without loading Whisper. STT defaults to `tiny.en`
-on CPU with int8 computation. `--stt-model base.en` uses a larger English model at
-additional processing cost. Other languages need a multilingual model, for example
-`--stt-model tiny --language pt`.
-
-## Optional delayed finalization
-
-Optional `--holdback 3` defers finalizing the newest three seconds for more context.
-It adds latency and is not consistently better across recordings; the default is
-zero. Require `0 <= holdback <= window - step`.
-With positive holdback, Ctrl+C closes capture and processes the buffered tail
-before exiting, which can take a few seconds. Zero holdback does not flush that tail.
+English STT is always enabled and defaults to `tiny.en` on CPU with int8 computation.
+`--stt-model base.en` uses a larger English model at additional processing cost.
+Each update prints newly recognized speech immediately after processing. Ctrl+C
+closes capture without running a final transcription pass on the buffered tail.
 
 ## Limitations and checks
 
-The pipeline requests exactly two speakers **in every window**, including windows
-containing only one voice. This can split one voice into artificial clusters.
+The pipeline allows one or two speakers per window, including windows where only
+one participant speaks. This does not guarantee that both voices are distinguished.
 Profile matching uses heuristic cosine thresholds; brief replies, similar voices,
 overlap, noise, and phone playback can cause merged or uncertain labels. Emitted
 lines are not revised later. This demo has no validated accuracy target.
@@ -154,5 +146,5 @@ python -m unittest discover -s tests -p 'test_diarization*.py' -v
 ```
 
 Tests cover label alignment, voice matching, word attribution, independent inspection,
-and delayed finalization using mocked model outputs. Live accuracy and performance
-require representative recordings.
+live launch, and stopping using mocked model outputs and capture. Live accuracy and
+performance require representative conversations.

@@ -109,40 +109,29 @@ def timestamp(seconds: float) -> str:
 class Diarizer:
     """Analyze snapshots while retaining only the state needed across windows.
 
-    The pipeline and optional Whisper model are loaded once and reused. Voice
+    The pipeline and Whisper model are loaded once and reused. Voice
     profiles retain identity; emitted_until marks the finalized output time.
     Overlapping audio is analyzed again, but finalized output is not rewritten.
     """
 
-    def __init__(self, pipeline, torch, whisper=None, language: str | None = "en",
-                 holdback: float = 0.0, inspect: bool = False):
+    def __init__(self, pipeline, torch, whisper, inspect: bool = False):
         self.pipeline = pipeline
         self.torch = torch
         self.whisper = whisper
-        self.language = language
-        self.holdback = holdback
         self.inspect = inspect
         # Times below are session-relative seconds, unlike the sample counters
         # in RollingAudio. No full conversation audio is accumulated here.
         self.emitted_until = 0.0
         self.voices = VoiceTracker()
 
-    def process(self, samples: np.ndarray, start: float, *, final: bool = False) -> None:
-        """Analyze one mono snapshot starting at session time ``start``.
-
-        ``final=True`` is used when stopping with holdback enabled: it releases
-        deferred output up to this snapshot's end instead of waiting for context.
-        """
+    def process(self, samples: np.ndarray, start: float) -> None:
+        """Analyze one mono snapshot starting at session time ``start``."""
         end = start + len(samples) / DEFAULT_SAMPLE_RATE
-        # Revisit the newest speech with more context before printing it.
-        # Holdback delays output, not capture or inference. The maximum prevents
-        # the finalized time from moving backward on a shorter/overlapping update.
-        emit_until = end if final else max(self.emitted_until, end - self.holdback)
         began = time.perf_counter()
         # Gradients are unnecessary for inference. Add a channel dimension to
         # turn a [samples] array into Pyannote's [channels, samples] tensor.
-        # Known limitation: exactly two speakers are requested in EVERY window,
-        # even when one person speaks alone. This can create artificial groups.
+        # A two-person conversation may contain only one voice in a given window.
+        # Allow the model to find one or two speakers rather than forcing two.
         with self.torch.inference_mode():
             output = self.pipeline(
                 {"waveform": self.torch.from_numpy(samples).unsqueeze(0),
@@ -175,37 +164,29 @@ class Diarizer:
             # Print acoustic turns even if Whisper returns no words. The local
             # ID exposes model groups before cross-window voice matching.
             for (a, b, label), (_, _, local) in zip(turns, local_turns):
-                a, b = max(a, self.emitted_until), min(b, emit_until)
+                a, b = max(a, self.emitted_until), min(b, end)
                 if b > a:
                     print(f"[TURN {timestamp(a)}-{timestamp(b)}] {label} (model={local})", flush=True)
-            if self.whisper is not None:
-                words = self.recognize(samples, start, emit_until=emit_until)
-                if words:
-                    a = max(words[0][0], self.emitted_until)
-                    print(f"[STT {timestamp(a)}-{timestamp(words[-1][1])}] "
-                          + " ".join(text for _, _, text in words), flush=True)
-                elif emit_until > max(start, self.emitted_until):
-                    print(f"[STT {timestamp(max(start, self.emitted_until))}-{timestamp(emit_until)}] "
-                          "(no text)", flush=True)
-        elif self.whisper is not None and turns:
+            words = self.recognize(samples, start)
+            if words:
+                a = max(words[0][0], self.emitted_until)
+                print(f"[STT {timestamp(a)}-{timestamp(words[-1][1])}] "
+                      + " ".join(text for _, _, text in words), flush=True)
+            elif end > max(start, self.emitted_until):
+                print(f"[STT {timestamp(max(start, self.emitted_until))}-{timestamp(end)}] "
+                      "(no text)", flush=True)
+        elif turns:
             # Normal view joins recognized words to tracked session speakers.
-            lines = self.transcribe(samples, start, turns, emit_until=emit_until)
+            lines = self.transcribe(samples, start, turns)
             for a, b, label, text in lines:
                 print(f"[{timestamp(a)}-{timestamp(b)}] {label}: {text}", flush=True)
-            if not lines and any(min(b, emit_until) > max(a, self.emitted_until)
+            if not lines and any(min(b, end) > max(a, self.emitted_until)
                                  for a, b, _ in turns):
                 # Speech turns and recognized words come from different models.
                 # This can mean empty STT or no words passing time/turn alignment;
                 # it does not mean the vocabulary has already appeared before.
                 print("Speech detected, but no new words recognized in this window.",
                       file=sys.stderr, flush=True)
-        else:
-            # Speaker-only mode still clips to the newly finalized time interval.
-            for a, b, label in turns:
-                a = max(a, self.emitted_until)
-                b = min(b, emit_until)
-                if b > a:
-                    print(f"[{timestamp(a)}-{timestamp(b)}] {label}", flush=True)
         elapsed = time.perf_counter() - began
         rms = float(np.sqrt(np.mean(samples ** 2)))
         # dBFS expresses signal level relative to full-scale amplitude 1.0.
@@ -223,10 +204,10 @@ class Diarizer:
         print(f"Analyzed {timestamp(start)}-{timestamp(end)} in {elapsed:.2f}s"
               + details, file=sys.stdout if self.inspect else sys.stderr, flush=True)
         # Normal diagnostics use stderr so stdout can be saved as a transcript.
-        # Finalize only to emit_until; deferred speech can be analyzed again.
-        self.emitted_until = emit_until
+        # Keep the finalized time monotonic when snapshots overlap.
+        self.emitted_until = max(self.emitted_until, end)
 
-    def recognize(self, samples: np.ndarray, start: float, *, emit_until: float | None = None):
+    def recognize(self, samples: np.ndarray, start: float):
         """Return (session_start, session_end, text) for newly eligible words.
 
         This path does not require speaker turns, so inspection can show words
@@ -238,7 +219,7 @@ class Diarizer:
         # attach words to speakers later instead of guessing from whole sentences.
         segments, _ = self.whisper.transcribe(
             samples,
-            language=self.language,
+            language="en",
             beam_size=1,
             best_of=1,
             temperature=0.0,
@@ -256,16 +237,12 @@ class Diarizer:
                 # containing its midpoint. Avoid repeating the overlapping half.
                 if b <= a or (a + b) / 2 < self.emitted_until:
                     continue
-                if emit_until is not None and (a + b) / 2 >= emit_until:
-                    # Defer this recent word; a future overlapping snapshot can
-                    # recognize and attribute it again with additional context.
-                    continue
                 text = word.word.strip()
                 if text:
                     words.append((a, b, text))
         return words
 
-    def transcribe(self, samples: np.ndarray, start: float, turns, *, emit_until: float | None = None):
+    def transcribe(self, samples: np.ndarray, start: float, turns):
         """Assign each eligible word to its most-overlapping speaker turn.
 
         Called only with nonempty turns. Consecutive words assigned to the same
@@ -273,7 +250,7 @@ class Diarizer:
         are convenient output groups, not guaranteed complete sentences or turns.
         """
         lines: list[tuple[float, float, str, str]] = []
-        for a, b, text in self.recognize(samples, start, emit_until=emit_until):
+        for a, b, text in self.recognize(samples, start):
             turn = max(turns, key=lambda turn: max(0.0, min(b, turn[1]) - max(a, turn[0])))
             if min(b, turn[1]) <= max(a, turn[0]):
                 # Avoid assigning text to a speaker without detected speech there.
@@ -290,12 +267,11 @@ class Diarizer:
         return lines
 
 
-def load_diarizer(stt_model: str | None = DEFAULT_STT_MODEL, language: str | None = "en",
-                 holdback: float = 0.0, inspect: bool = False) -> Diarizer:
+def load_diarizer(stt_model: str = DEFAULT_STT_MODEL, inspect: bool = False) -> Diarizer:
     """Load pretrained models once and assemble their per-session coordinator.
 
-    Passing stt_model=None skips Whisper. Heavy dependencies are imported here
-    so --help, --list-devices, and --check-mic do not load the neural models.
+    Heavy dependencies are imported here so --help, --list-devices, and --check-mic
+    do not load the neural models. Listening always includes English transcription.
     """
     import torch
 
@@ -353,18 +329,16 @@ def load_diarizer(stt_model: str | None = DEFAULT_STT_MODEL, language: str | Non
     if pipeline is None:
         raise RuntimeError("Model access denied. Check HF_TOKEN and the model access agreement.")
     pipeline.to(device)
-    whisper = None
-    if stt_model is not None:
-        # Reuse the app's cached CPU/int8 loader. Timestamp alignment stays
-        # isolated here because the app's transcribe_audio returns plain text.
-        from sim.speech_to_text import _load_model
+    # Reuse the app's cached CPU/int8 loader. Timestamp alignment stays
+    # isolated here because the app's transcribe_audio returns plain text.
+    from sim.speech_to_text import _load_model
 
-        print(f"Transcription: {stt_model}, CPU int8, language={language or 'auto'} "
-              "(first run downloads Whisper weights)...", flush=True)
-        whisper = _load_model(stt_model)
+    print(f"Transcription: {stt_model}, CPU int8, language=en "
+          "(first run downloads Whisper weights)...", flush=True)
+    whisper = _load_model(stt_model)
     # Reuse the application's loader, but keep timestamped recognition and
     # speaker alignment in this demo; the app's plain-text STT path is unchanged.
-    return Diarizer(pipeline, torch, whisper, language, holdback=holdback, inspect=inspect)
+    return Diarizer(pipeline, torch, whisper, inspect=inspect)
 
 
 class RollingAudio:
@@ -438,6 +412,7 @@ def run_live(diarizer: Diarizer | None, device: int | None, window: int, step: i
 
     window and step are integer SAMPLE counts, converted from CLI seconds in
     main(). diarizer=None selects the levels-only check without loading models.
+    Ctrl+C exits the stream context and closes capture without a final model pass.
     """
     import sounddevice as sd
 
@@ -471,60 +446,43 @@ def run_live(diarizer: Diarizer | None, device: int | None, window: int, step: i
                   "No models/token needed. Ctrl+C to stop.", flush=True)
         else:
             print(f"Listening: 16 kHz mono; {window / DEFAULT_SAMPLE_RATE:g}s window, "
-                  f"{step / DEFAULT_SAMPLE_RATE:g}s interval; exactly 2 speakers. Ctrl+C to stop.", flush=True)
-            if diarizer.holdback:
-                print(f"Finalization holdback: {diarizer.holdback:g}s; "
-                      "Ctrl+C finalizes buffered audio before closing.", flush=True)
+                  f"{step / DEFAULT_SAMPLE_RATE:g}s interval; up to 2 speakers. Ctrl+C to stop.", flush=True)
         # Wait for the first full window before inference. In microphone-check
         # mode both window and step are one second, giving one levels update/sec.
         next_sample = window
-        try:
-            while True:
-                if capture_error or not stream.active:
-                    raise RuntimeError(f"Microphone stream stopped: {capture_error or 'device disconnected'}")
-                if time.monotonic() - last_capture > 5:
-                    # Distinguish a stalled stream from valid but silent audio.
-                    raise RuntimeError("Microphone stopped delivering audio. Check the selected input device.")
-                snapshot = audio.snapshot(next_sample)
-                if snapshot is None:
-                    # Short waits keep Ctrl+C responsive without a busy loop.
-                    time.sleep(0.05)
-                    continue
-                samples, total = snapshot
-                if diarizer is None:
-                    # Levels diagnose whether the selected input actually carries
-                    # audio. They do not establish whether speech is intelligible.
-                    rms = float(np.sqrt(np.mean(samples ** 2)))
-                    peak = float(np.max(np.abs(samples)))
-                    level = 20 * np.log10(max(rms, 1e-12))
-                    peak_level = 20 * np.log10(max(peak, 1e-12))
-                    hint = " -- nearly silent; check headset mute, boom, and input volume" if peak_level < -65 else ""
-                    print(f"Input {total / DEFAULT_SAMPLE_RATE:.1f}s: RMS {level:.0f} dBFS, "
-                          f"peak {peak_level:.0f} dBFS{hint}", flush=True)
-                    if total >= 10 * DEFAULT_SAMPLE_RATE:
-                        print("Microphone check complete. Microphone closed.", flush=True)
-                        return
-                else:
-                    # Derive the snapshot's session start from captured samples,
-                    # not wall-clock time spent loading models or doing inference.
-                    diarizer.process(samples, (total - len(samples)) / DEFAULT_SAMPLE_RATE)
-                # Request at least step NEW samples beyond this snapshot. Capture
-                # continues during inference, so updates may cover more than step
-                # seconds and are not guaranteed to arrive on an exact schedule.
-                next_sample = total + step
-        except KeyboardInterrupt:
-            if diarizer is not None and diarizer.holdback:
-                # Freeze capture before the final snapshot so the buffered tail
-                # has a fixed end. final=True releases the holdback interval.
-                stream.stop()
-                snapshot = audio.snapshot(1)
-                if snapshot is not None:
-                    samples, total = snapshot
-                    print("Finalizing buffered audio...", flush=True)
-                    diarizer.process(samples, (total - len(samples)) / DEFAULT_SAMPLE_RATE, final=True)
-            # The stream context closes the device; main() prints the stop message.
-            # With zero holdback, stopping does not run another inference pass.
-            raise
+        while True:
+            if capture_error or not stream.active:
+                raise RuntimeError(f"Microphone stream stopped: {capture_error or 'device disconnected'}")
+            if time.monotonic() - last_capture > 5:
+                # Distinguish a stalled stream from valid but silent audio.
+                raise RuntimeError("Microphone stopped delivering audio. Check the selected input device.")
+            snapshot = audio.snapshot(next_sample)
+            if snapshot is None:
+                # Short waits keep Ctrl+C responsive without a busy loop.
+                time.sleep(0.05)
+                continue
+            samples, total = snapshot
+            if diarizer is None:
+                # Levels diagnose whether the selected input actually carries
+                # audio. They do not establish whether speech is intelligible.
+                rms = float(np.sqrt(np.mean(samples ** 2)))
+                peak = float(np.max(np.abs(samples)))
+                level = 20 * np.log10(max(rms, 1e-12))
+                peak_level = 20 * np.log10(max(peak, 1e-12))
+                hint = " -- nearly silent; check headset mute, boom, and input volume" if peak_level < -65 else ""
+                print(f"Input {total / DEFAULT_SAMPLE_RATE:.1f}s: RMS {level:.0f} dBFS, "
+                      f"peak {peak_level:.0f} dBFS{hint}", flush=True)
+                if total >= 10 * DEFAULT_SAMPLE_RATE:
+                    print("Microphone check complete. Microphone closed.", flush=True)
+                    return
+            else:
+                # Derive the snapshot's session start from captured samples,
+                # not wall-clock time spent loading models or doing inference.
+                diarizer.process(samples, (total - len(samples)) / DEFAULT_SAMPLE_RATE)
+            # Request at least step NEW samples beyond this snapshot. Capture
+            # continues during inference, so updates may cover more than step
+            # seconds and are not guaranteed to arrive on an exact schedule.
+            next_sample = total + step
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -540,17 +498,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--device", type=int, help="Input device ID (default: system microphone).")
     parser.add_argument("--check-mic", action="store_true",
                         help="Show microphone levels for 10 seconds without loading models or using HF_TOKEN.")
-    # window controls how much recent context is analyzed. step controls how much
-    # new audio is required before the next snapshot. holdback delays final output.
+    # window controls recent context; step controls new audio before each snapshot.
     parser.add_argument("--window", type=float, default=6.0, help="Analysis window seconds (default: 6).")
     parser.add_argument("--step", type=float, default=3.0, help="Analysis interval seconds (default: 3).")
-    parser.add_argument("--holdback", type=float, default=0.0,
-                        help="Wait for more context before finalizing labels, in seconds (default: 0).")
-    # STT can be disabled independently. English-only .en models cannot transcribe
-    # other languages; use a multilingual Whisper model with a different language.
-    parser.add_argument("--no-transcript", action="store_true", help="Print speaker labels only; do not load Whisper.")
+    # English STT is always enabled; the model can still be selected for comparison.
     parser.add_argument("--stt-model", default=DEFAULT_STT_MODEL, help="Whisper model (default: tiny.en; base.en for better English accuracy).")
-    parser.add_argument("--language", default="en", help="Speech language code (default: en; use auto to detect).")
     # Inspection separates model outputs so missing STT is not mistaken for
     # missing speaker turns. Session voice tracking is always enabled.
     parser.add_argument("--inspect", action="store_true",
@@ -558,15 +510,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not (0 < args.step <= args.window < float("inf")):
         parser.error("Require 0 < --step <= --window, with finite durations.")
-    if not 0 <= args.holdback <= args.window - args.step:
-        # After the next update, deferred audio must still fit in the ring buffer.
-        parser.error("Require 0 <= --holdback <= --window minus --step so deferred audio stays in the buffer.")
     window, step = (round(value * DEFAULT_SAMPLE_RATE) for value in (args.window, args.step))
     # The CLI uses seconds; the stream/buffer operate on whole samples.
     if not step:
         parser.error("--step must be at least one sample.")
-    if not args.no_transcript and args.stt_model.endswith(".en") and args.language not in ("en", "auto"):
-        parser.error("For other languages, use a multilingual model, e.g. --stt-model tiny --language pt.")
     try:
         if args.list_devices:
             list_devices()
@@ -580,9 +527,7 @@ def main(argv: list[str] | None = None) -> int:
             # One-second snapshots for ten seconds, without touching either model.
             run_live(None, args.device, DEFAULT_SAMPLE_RATE, DEFAULT_SAMPLE_RATE)
             return 0
-        diarizer = load_diarizer(None if args.no_transcript else args.stt_model,
-                                None if args.language == "auto" else args.language,
-                                holdback=args.holdback, inspect=args.inspect)
+        diarizer = load_diarizer(args.stt_model, inspect=args.inspect)
         if args.inspect:
             print("Inspection: TURN shows speaker intervals and local model IDs; "
                   "STT shows recognized text independently.", flush=True)

@@ -2,11 +2,11 @@ from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from io import StringIO
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 
-from diarization_demo import DEFAULT_SAMPLE_RATE, Diarizer, VoiceTracker
+from diarization_demo import DEFAULT_SAMPLE_RATE, Diarizer, VoiceTracker, main, run_live
 
 
 class DiarizationDemoTests(unittest.TestCase):
@@ -28,28 +28,8 @@ class DiarizationDemoTests(unittest.TestCase):
         ])
         torch = Mock()
         torch.inference_mode.side_effect = nullcontext
-        diarizer = Diarizer(pipeline, torch)
         samples = np.zeros(6 * DEFAULT_SAMPLE_RATE, dtype=np.float32)
-        stdout = StringIO()
-        with redirect_stdout(stdout), redirect_stderr(StringIO()):
-            diarizer.process(samples, start=0)
-            diarizer.process(samples, start=3)
-
-        self.assertEqual(stdout.getvalue().splitlines(), [
-            "[00:01.000-00:04.000] SPEAKER_00",
-            "[00:04.000-00:06.000] SPEAKER_01",
-            "[00:06.000-00:09.000] SPEAKER_00",
-        ])
-        self.assertEqual(diarizer.emitted_until, 9)
-        for call in pipeline.call_args_list:
-            self.assertEqual(call.kwargs, {"min_speakers": 1, "max_speakers": 2})
-            self.assertEqual(call.args[0]["sample_rate"], 16000)
-
         # Exercise transcription without importing or downloading Whisper.
-        pipeline.side_effect = [
-            output([(1, 4, "SPEAKER_00"), (4, 6, "SPEAKER_01")]),
-            output([(0, 3, "SPEAKER_00"), (3, 6, "SPEAKER_01")], [[0, 1], [1, 0]]),
-        ]
         def segment(words):
             return [SimpleNamespace(words=[
                 SimpleNamespace(start=a, end=b, word=text) for a, b, text in words
@@ -70,7 +50,12 @@ class DiarizationDemoTests(unittest.TestCase):
             "[00:04.200-00:05.000] SPEAKER_01: Hi.",
             "[00:06.200-00:08.000] SPEAKER_00: How are you?",
         ])
+        self.assertEqual(diarizer.emitted_until, 9)
+        for call in pipeline.call_args_list:
+            self.assertEqual(call.kwargs, {"min_speakers": 1, "max_speakers": 2})
+            self.assertEqual(call.args[0]["sample_rate"], 16000)
         self.assertTrue(whisper.transcribe.call_args.kwargs["word_timestamps"])
+        self.assertEqual(whisper.transcribe.call_args.kwargs["language"], "en")
 
         # Session voice matching survives a gap and reversed local cluster IDs.
         voices = VoiceTracker()
@@ -90,6 +75,50 @@ class DiarizationDemoTests(unittest.TestCase):
             self.assertEqual(voices.assign(unclear, [(60, 66, "SPEAKER_00")]),
                              {"SPEAKER_00": "SPEAKER_UNKNOWN"})
         self.assertEqual(len(voices.profiles), 2)
+
+    def test_live_command_loads_stt_and_preserves_window_and_step(self):
+        sd = Mock()
+        sd.query_devices.return_value = {"name": "Test microphone"}
+        with (
+            patch.dict("sys.modules", {"sounddevice": sd}),
+            patch("diarization_demo.load_diarizer") as load,
+            patch("diarization_demo.run_live") as live,
+            redirect_stdout(StringIO()),
+        ):
+            self.assertEqual(main(["--window", "15", "--step", "3"]), 0)
+        load.assert_called_once_with("tiny.en", inspect=False)
+        live.assert_called_once_with(load.return_value, None, 240000, 48000)
+
+    def test_ctrl_c_closes_capture_without_transcribing_buffered_tail(self):
+        stream = Mock(active=True)
+        stream.__exit__ = Mock(return_value=False)
+        diarizer = Mock()
+
+        def input_stream(**kwargs):
+            def enter():
+                # Enough audio for the first window; more arrives during inference.
+                kwargs["callback"](np.ones((240000, 1), dtype=np.float32), 240000, None, None)
+                return stream
+
+            def process(*args):
+                kwargs["callback"](np.ones((16000, 1), dtype=np.float32), 16000, None, None)
+
+            stream.__enter__ = Mock(side_effect=enter)
+            diarizer.process.side_effect = process
+            return stream
+
+        with (
+            patch.dict("sys.modules", {"sounddevice": SimpleNamespace(InputStream=input_stream)}),
+            patch("diarization_demo.time.sleep", side_effect=KeyboardInterrupt),
+            redirect_stdout(StringIO()),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            run_live(diarizer, None, 240000, 48000)
+        diarizer.process.assert_called_once()
+        self.assertEqual(len(diarizer.process.call_args.args[0]), 240000)
+        self.assertEqual(diarizer.process.call_args.args[1], 0)
+        self.assertEqual(diarizer.process.call_args.kwargs, {})
+        stream.__exit__.assert_called_once()
 
 
 if __name__ == "__main__":
