@@ -250,6 +250,12 @@ and prints timestamps, speaker IDs, and local Whisper transcription. It also sup
 WAV replay, independent speaker/STT inspection, and optional nurse/patient role
 estimates. It does not require Ollama.
 
+Run it through the shared entry point using the demo's Python environment:
+
+```bash
+python main.py --diarization --track-speakers --window 15 --step 3
+```
+
 Install it in its own environment using the linked guide; its Pyannote/PyTorch
 dependencies are separate from the simulation requirements. Windows CUDA has been
 used locally. Apple Silicon dependency resolution has been checked, but Mac runtime
@@ -258,7 +264,7 @@ and live performance still need testing; the current code uses CPU on macOS.
 ## Project Layout
 
 ```text
-main.py                 Typed and --voice terminal entry point
+main.py                 Typed, --voice, and --diarization terminal entry point
 voice_demo.py           Backward-compatible voice launcher
 sim/
   app.py                Typed terminal app flow

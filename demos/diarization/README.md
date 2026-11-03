@@ -1,9 +1,10 @@
 # Live two-speaker diarization and STT
 
-`diarization_demo.py` prints timestamps, speaker IDs, and local Whisper text from a
-microphone or WAV file. Pyannote Community-1 supplies speaker turns. Optional session
-voice profiles match IDs across windows. This standalone experiment does not call
-Ollama or decide when an LLM should speak.
+`python main.py --diarization` prints timestamps, speaker IDs, and local Whisper text
+from a microphone or WAV file. The implementation lives in `diarization_demo.py`,
+which can also be run directly. Pyannote Community-1 supplies speaker turns.
+Optional session voice profiles match IDs across windows. This standalone experiment
+does not call Ollama or decide when an LLM should speak.
 
 ## Installation
 
@@ -63,8 +64,8 @@ input are passed as tensors and do not require FFmpeg.
 List inputs and check the selected input before loading models:
 
 ```bash
-python diarization_demo.py --list-devices
-python diarization_demo.py --check-mic
+python main.py --diarization --list-devices
+python main.py --diarization --check-mic
 ```
 
 Add `--device ID` to select an input from the list; IDs vary by computer. On macOS,
@@ -75,7 +76,7 @@ input, mute, permission, or positioning problem.
 For timestamps, speaker IDs, and text without estimated roles:
 
 ```bash
-python diarization_demo.py --track-speakers --window 15 --step 3
+python main.py --diarization --track-speakers --window 15 --step 3
 ```
 
 Illustrative output:
@@ -103,7 +104,7 @@ Stop with Ctrl+C. To save normal output in PowerShell:
 ```powershell
 New-Item -ItemType Directory -Force .\transcripts | Out-Null
 $log = ".\transcripts\diarization-$(Get-Date -Format yyyyMMdd-HHmmss).txt"
-.\.venv\diarization\Scripts\python.exe .\diarization_demo.py --track-speakers --window 15 --step 3 |
+.\.venv\diarization\Scripts\python.exe .\main.py --diarization --track-speakers --window 15 --step 3 |
     Tee-Object -FilePath $log
 ```
 
@@ -114,7 +115,7 @@ For only timestamped speaker/text lines, append
 ## Inspect diarization and STT separately
 
 ```bash
-python diarization_demo.py --track-speakers --window 15 --step 3 --inspect
+python main.py --diarization --track-speakers --window 15 --step 3 --inspect
 ```
 
 Inspection prints `[TURN ...] SPEAKER_00 (model=SPEAKER_01)` intervals and independent
@@ -136,7 +137,7 @@ additional processing cost. Other languages need a multilingual model, for examp
 ## WAV replay and delayed finalization
 
 ```bash
-python diarization_demo.py --wav path/to/conversation.wav --track-speakers --window 15 --step 3
+python main.py --diarization --wav path/to/conversation.wav --track-speakers --window 15 --step 3
 ```
 
 Input must be 16 kHz mono 16-bit PCM WAV. Convert other formats with an independently
