@@ -1,10 +1,32 @@
 # Live two-speaker diarization and STT
 
 `python main.py --diarization` prints timestamps, speaker IDs, and local Whisper text
-from a microphone. The implementation lives in `diarization_demo.py`,
-which can also be run directly. Pyannote Community-1 supplies speaker turns.
-Session voice profiles automatically match IDs across windows. This standalone
-experiment does not call Ollama or decide when an LLM should speak.
+from a microphone. The implementation lives under `sim/diarization/`;
+`diarization_demo.py` is a compatibility launcher that can also be run directly.
+Pyannote Community-1 supplies speaker turns, Whisper supplies timestamped words,
+and session voice profiles match acoustic IDs across windows. This standalone
+service does not call Ollama, infer participant roles, or decide when an LLM speaks.
+
+## Architecture and result contract
+
+The package separates configuration and typed results, lazy model providers,
+acoustic voice tracking, word alignment, stateful processing, bounded microphone
+capture, and CLI presentation. Core processing does not print. Its public service
+interface is:
+
+```python
+result = service.process(samples, start_seconds)
+final_result = service.flush()
+```
+
+`ProcessingResult` contains typed speaker turns, recognized words, newly finalized
+utterances, the complete replacement set of provisional utterances, audio gaps,
+and diagnostics. Finalized utterances are append-only. Provisional utterances may
+be corrected by the next overlapping window and should replace the previous
+provisional tail. `flush()` finalizes that tail once and then closes the service.
+
+`SPEAKER_00`, `SPEAKER_01`, and `SPEAKER_UNKNOWN` are acoustic identifiers only.
+They never imply nurse, patient, learner, or other simulation roles.
 
 ## Installation
 
@@ -34,11 +56,11 @@ python -m pip install --upgrade pip
 python -m pip install -r demos/diarization/requirements.txt
 ```
 
-Dependency resolution has been checked for macOS ARM64/Python 3.12. Installation,
-microphone capture, and model execution still need testing on actual Mac hardware.
-The code selects CPU on macOS; Apple's MPS GPU backend is not used. Live processing
-may fall behind. Intel Macs cannot use this pinned stack because PyTorch 2.9.1 has
-no macOS x86_64 wheel; they need a separately tested setup.
+The isolated dependency set has been checked on macOS ARM64/Python 3.12. The code
+selects CPU on macOS; Apple's MPS GPU backend is not used. Live processing may fall
+behind. Intel Macs cannot use this pinned stack because PyTorch 2.9.1 has no macOS
+x86_64 wheel; they need a separately tested setup. See the Apple Silicon preflight
+results below for the remaining hardware-validation blocker.
 
 Below, `python` assumes the demo environment is activated. On Windows, replace it
 with `.\.venv\diarization\Scripts\python.exe` if it is not activated.
@@ -82,8 +104,8 @@ python main.py --diarization --window 15 --step 3
 Illustrative output:
 
 ```text
-[00:02.100-00:05.700] SPEAKER_00: Good morning. How are you feeling?
-[00:06.000-00:08.200] SPEAKER_01: I feel better today.
+[FINAL 00:02.100-00:05.700] SPEAKER_00: Good morning. How are you feeling?
+[PROVISIONAL 00:06.000-00:08.200] SPEAKER_01: I feel better today.
 ```
 
 `--window 15` analyzes the latest fifteen seconds. `--step 3` waits for at least
@@ -91,13 +113,20 @@ three seconds of additional captured audio between snapshots. The first result
 waits for a full window; processing adds delay. The CLI default window is six
 seconds, so specify fifteen explicitly to reproduce these commands. Capture
 continues during inference; losing audio when processing falls behind produces a
-gap warning. Raw microphone audio is not saved.
+structured gap warning. Raw microphone audio is not saved.
+
+The default `--finalization-delay 3` keeps the newest three seconds provisional
+so the next overlapping window can revise its speaker or text. Later output marks
+the corrected text `FINAL`. Set `--finalization-delay 0` for immediate final output.
+The delay must satisfy `0 <= finalization delay <= window - step`.
 
 The demo automatically learns up to two voice profiles for the current run. IDs
 have no role meaning; uncertain matches appear as `SPEAKER_UNKNOWN`. The IDs track
 acoustic voices without estimating which person is a nurse or patient.
 
-Stop with Ctrl+C. To save normal output in PowerShell:
+Stop with Ctrl+C. Capture stops first, the newest retained snapshot is processed,
+and `flush()` emits the remaining tail as `FINAL` before the microphone closes.
+To save normal output in PowerShell:
 
 ```powershell
 New-Item -ItemType Directory -Force .\transcripts | Out-Null
@@ -107,8 +136,8 @@ $log = ".\transcripts\diarization-$(Get-Date -Format yyyyMMdd-HHmmss).txt"
 ```
 
 Normal analysis diagnostics go to stderr. Keep them visible when troubleshooting.
-For only timestamped speaker/text lines, append
-`| Where-Object { $_ -match '^\[\d.*\]\s+SPEAKER_' }` to the PowerShell pipeline.
+For only finalized speaker/text lines, append
+`| Where-Object { $_ -match '^\[FINAL\s' }` to the PowerShell pipeline.
 
 ## Inspect diarization and STT separately
 
@@ -123,21 +152,20 @@ Pyannote label, which can change between windows; the main ID is the session lab
 Normal output assigns recognized words to their most-overlapping speaker turn and
 discards words outside detected turns. Inspection keeps STT independent of those
 turns to distinguish transcription failures from segmentation or matching failures.
-"Speech detected, but no new words recognized" means no aligned words were ready
-to print in the newly emitted time interval. Repeated vocabulary is not removed.
+Repeated vocabulary is not removed.
 
-English STT is always enabled and defaults to `tiny.en` on CPU with int8 computation.
-`--stt-model base.en` uses a larger English model at additional processing cost.
-Each update prints newly recognized speech immediately after processing. Ctrl+C
-closes capture without running a final transcription pass on the buffered tail.
+STT defaults to `tiny.en` on CPU with int8 computation. `--stt-model base.en` uses
+a larger English model at additional processing cost. `--language` configures the
+Whisper language code; select a multilingual Whisper model for non-English speech.
 
 ## Limitations and checks
 
 The pipeline allows one or two speakers per window, including windows where only
 one participant speaks. This does not guarantee that both voices are distinguished.
 Profile matching uses heuristic cosine thresholds; brief replies, similar voices,
-overlap, noise, and phone playback can cause merged or uncertain labels. Emitted
-lines are not revised later. This demo has no validated accuracy target.
+overlap, noise, and phone playback can cause merged or uncertain labels. Only the
+provisional tail can be revised; finalized output is never rewritten. This demo has
+no validated accuracy target.
 
 Run the tests without downloading models or using a microphone:
 
@@ -146,5 +174,30 @@ python -m unittest discover -s tests -p 'test_diarization*.py' -v
 ```
 
 Tests cover label alignment, voice matching, word attribution, independent inspection,
-live launch, and stopping using mocked model outputs and capture. Live accuracy and
-performance require representative conversations.
+provider failures, dropped audio, provisional/final output, final-buffer flushing,
+live launch, and shutdown using mocked model outputs and capture. Heavy PyTorch,
+Pyannote, Whisper, and SoundDevice imports occur only when their requested runtime
+paths are used; they remain isolated from the standard simulation environment.
+
+## Apple Silicon preflight — November 3, 2026
+
+The optional live test was attempted in the available Apple Silicon execution
+environment. Results must not be interpreted as a completed live accuracy test:
+
+| Check | Observed result |
+| --- | --- |
+| Host | arm64, macOS 26.5.1 |
+| Python | 3.12.0 in `.venv/diarization` |
+| Installation | Existing environment passed `pip check`; a clean reinstall was not performed |
+| Versions | Torch 2.9.1, Pyannote 4.0.4, faster-whisper 1.2.1, SoundDevice 0.5.3, NumPy 2.3.5 |
+| Runtime imports | Passed; Pyannote's optional TorchCodec decoder warned, but microphone tensors do not use it |
+| HF access preflight | A token with valid local shape was found; no token value was logged |
+| Microphone detection | Blocked: `--list-devices` returned no input devices in this execution environment |
+| Model-weight loading | Not attempted after the microphone gate failed |
+| Two-speaker capture, transcription, and tracking | Not run |
+| Ctrl+C finalization | Passed with mocked capture/service tests; not verified on physical hardware |
+| Processing latency | Not measured because live capture could not start |
+
+To complete the optional test, rerun the device check from a terminal with macOS
+microphone permission and a visible input, then exercise model loading, two-speaker
+capture, Ctrl+C finalization, and record the per-window `Analyzed ... in ...` timing.
