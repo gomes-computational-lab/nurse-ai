@@ -10,6 +10,15 @@ from .alignment import (
     to_session_speaker_turns,
     to_session_words,
 )
+from .capture import (
+    AudioCaptureError,
+    AudioSnapshot,
+    InputDevice,
+    MicrophoneCapture,
+    RollingAudio,
+    list_input_devices,
+    validate_input_device,
+)
 from .models import (
     AudioGap,
     ProcessingDiagnostics,
@@ -42,6 +51,8 @@ from .service import (
 
 __all__ = [
     "AudioGap",
+    "AudioCaptureError",
+    "AudioSnapshot",
     "DEFAULT_PYANNOTE_MODEL",
     "DEFAULT_WHISPER_MODEL",
     "DiarizationConfig",
@@ -51,6 +62,8 @@ __all__ = [
     "DiarizationServiceClosedError",
     "DiarizationServiceError",
     "LocalSpeakerTurn",
+    "InputDevice",
+    "MicrophoneCapture",
     "ProcessingDiagnostics",
     "ProcessingResult",
     "ProviderDependencyError",
@@ -59,6 +72,7 @@ __all__ = [
     "ProviderLoadError",
     "PyannoteDiarizationProvider",
     "RecognizedWord",
+    "RollingAudio",
     "SpeakerTurn",
     "TranscriptionProvider",
     "Utterance",
@@ -69,6 +83,8 @@ __all__ = [
     "align_words_to_speakers",
     "load_pyannote_provider",
     "load_whisper_provider",
+    "list_input_devices",
     "to_session_speaker_turns",
     "to_session_words",
+    "validate_input_device",
 ]

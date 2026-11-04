@@ -1,89 +1,60 @@
-from contextlib import nullcontext, redirect_stderr, redirect_stdout
+from __future__ import annotations
+
 from io import StringIO
-from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
 
-import numpy as np
-
-from diarization_demo import DEFAULT_SAMPLE_RATE, Diarizer
-
-
-def model_output(turns, embeddings):
-    annotation = Mock()
-    annotation.itertracks.return_value = [
-        (SimpleNamespace(start=a, end=b), 0, label) for a, b, label in turns]
-    annotation.labels.return_value = sorted({label for _, _, label in turns})
-    return SimpleNamespace(speaker_diarization=annotation,
-                           exclusive_speaker_diarization=annotation,
-                           speaker_embeddings=np.asarray(embeddings, dtype=float))
-
-
-def recognized(items):
-    return [SimpleNamespace(words=[SimpleNamespace(start=a, end=b, word=text)
-                                   for a, b, text in items])], None
+from sim.diarization import (
+    ProcessingDiagnostics,
+    ProcessingResult,
+    RecognizedWord,
+    SpeakerTurn,
+)
+from sim.diarization.cli import present_result
 
 
 class InspectionTests(unittest.TestCase):
-    def make_diarizer(self, output, transcript, **kwargs):
-        torch = Mock()
-        torch.inference_mode.side_effect = nullcontext
-        whisper = Mock()
-        whisper.transcribe.return_value = transcript
-        diarizer = Diarizer(Mock(return_value=output), torch, whisper, **kwargs)
-        return diarizer
-
-    def capture(self, diarizer, start=0):
+    def test_inspection_formats_structured_turns_words_and_diagnostics(self) -> None:
+        result = ProcessingResult(
+            speaker_turns=(
+                SpeakerTurn(0, 3, "SPEAKER_00", "LOCAL_01"),
+                SpeakerTurn(3, 6, "SPEAKER_01", "LOCAL_00"),
+            ),
+            recognized_words=(
+                RecognizedWord(1, 2, "Hello."),
+                RecognizedWord(4, 5, "Hi."),
+            ),
+            finalized_utterances=(),
+            provisional_utterances=(),
+            audio_gaps=(),
+            diagnostics=ProcessingDiagnostics(0, 6, 0.25, -20, -5, 2, 2, 2),
+        )
         stdout, stderr = StringIO(), StringIO()
-        with redirect_stdout(stdout), redirect_stderr(stderr):
-            diarizer.process(np.full(6 * DEFAULT_SAMPLE_RATE, .1, dtype=np.float32), start)
-        return stdout.getvalue(), stderr.getvalue()
 
-    def test_speaker_turns_are_visible_when_whisper_returns_no_words(self):
-        diarizer = self.make_diarizer(
-            model_output([(0, 3, 'SPEAKER_00'), (3, 6, 'SPEAKER_01')], [[1, 0], [0, 1]]),
-            ([], None), inspect=True)
-        stdout, stderr = self.capture(diarizer)
-        self.assertIn('[TURN 00:00.000-00:03.000] SPEAKER_00 (model=SPEAKER_00)', stdout)
-        self.assertIn('[TURN 00:03.000-00:06.000] SPEAKER_01 (model=SPEAKER_01)', stdout)
-        self.assertIn('[STT 00:00.000-00:06.000] (no text)', stdout)
-        self.assertIn('input RMS -20 dBFS, peak -20 dBFS', stdout)
-        self.assertIn('model=2, tracked=2, profiles=2/2', stdout)
-        self.assertNotIn('ROLE_', stdout)
-        self.assertNotIn('no new words', stdout + stderr)
+        present_result(result, inspect=True, stdout=stdout, stderr=stderr)
 
-    def test_independent_stt_runs_even_when_pyannote_detects_no_speech(self):
-        diarizer = self.make_diarizer(model_output([], np.empty((0, 2))),
-                                    recognized([(1, 2, 'Hello.')]), inspect=True)
-        stdout, _ = self.capture(diarizer)
-        self.assertIn('[STT 00:01.000-00:02.000] Hello.', stdout)
-        self.assertNotIn('[TURN ', stdout)
-        self.assertIn('model=0, tracked=0, profiles=0/2', stdout)
-        diarizer.whisper.transcribe.assert_called_once()
+        self.assertIn("[TURN 00:00.000-00:03.000] SPEAKER_00 (model=LOCAL_01)", stdout.getvalue())
+        self.assertIn("[TURN 00:03.000-00:06.000] SPEAKER_01 (model=LOCAL_00)", stdout.getvalue())
+        self.assertIn("[STT 00:01.000-00:05.000] Hello. Hi.", stdout.getvalue())
+        self.assertIn("input RMS -20 dBFS, peak -5 dBFS", stdout.getvalue())
+        self.assertIn("model=2, tracked=2, profiles=2", stdout.getvalue())
+        self.assertNotIn("ROLE_", stdout.getvalue())
+        self.assertEqual(stderr.getvalue(), "")
 
-    def test_independent_stt_is_not_hidden_by_nonoverlapping_speaker_turns(self):
-        diarizer = self.make_diarizer(model_output([(0, 1, 'SPEAKER_00')], [[1, 0]]),
-                                    recognized([(2, 3, 'Outside the turn.')]), inspect=True)
-        stdout, _ = self.capture(diarizer)
-        self.assertIn('[TURN 00:00.000-00:01.000]', stdout)
-        self.assertIn('[STT 00:02.000-00:03.000] Outside the turn.', stdout)
+    def test_inspection_reports_empty_independent_transcription(self) -> None:
+        result = ProcessingResult(
+            speaker_turns=(SpeakerTurn(0, 6, "SPEAKER_00", "LOCAL_00"),),
+            recognized_words=(),
+            finalized_utterances=(),
+            provisional_utterances=(),
+            audio_gaps=(),
+            diagnostics=ProcessingDiagnostics(0, 6, 0.1, -30, -10, 1, 1, 1),
+        )
+        stdout = StringIO()
 
-    def test_automatic_tracking_keeps_the_combined_transcript_format(self):
-        diarizer = self.make_diarizer(model_output([(0, 6, 'SPEAKER_00')], [[1, 0]]),
-                                    recognized([(1, 2, 'Hello.')]))
-        stdout, _ = self.capture(diarizer)
-        self.assertIsNotNone(diarizer.voices)
-        self.assertEqual(stdout, '[00:01.000-00:02.000] SPEAKER_00: Hello.\n')
+        present_result(result, inspect=True, stdout=stdout, stderr=StringIO())
 
-    def test_repeated_words_in_later_audio_are_still_printed(self):
-        diarizer = self.make_diarizer(model_output([(0, 6, 'SPEAKER_00')], [[1, 0]]),
-                                    recognized([(1, 2, 'Yes.')]), inspect=True)
-        first, _ = self.capture(diarizer)
-        diarizer.whisper.transcribe.return_value = recognized([(3, 4, 'Yes.')])
-        second, _ = self.capture(diarizer, start=3)
-        self.assertIn('[STT 00:01.000-00:02.000] Yes.', first)
-        self.assertIn('[STT 00:06.000-00:07.000] Yes.', second)
+        self.assertIn("[STT 00:00.000-00:06.000] (no text)", stdout.getvalue())
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()
