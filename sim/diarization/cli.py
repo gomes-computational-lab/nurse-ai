@@ -1,4 +1,10 @@
-"""Command-line presentation for the standalone live diarization service."""
+"""Command-line assembly and presentation for the live diarization service.
+
+This is intentionally the only module in the processing path that formats or
+prints results.  Capture returns snapshots, providers return model-independent
+values, and the service returns ``ProcessingResult`` objects.  Keeping terminal
+concerns here lets another client reuse the same service without scraping text.
+"""
 
 from __future__ import annotations
 
@@ -29,6 +35,8 @@ CaptureFactory = Callable[..., MicrophoneCapture]
 
 
 def timestamp(seconds: float) -> str:
+    """Render session seconds as the compact ``MM:SS.mmm`` CLI format."""
+
     milliseconds = round(max(0.0, seconds) * 1000)
     minutes, remainder = divmod(milliseconds, 60_000)
     return f"{minutes:02d}:{remainder // 1000:02d}.{remainder % 1000:03d}"
@@ -42,9 +50,19 @@ def present_result(
     stderr: TextIO | None = None,
     include_diagnostics: bool = True,
 ) -> None:
-    """Format one typed service result; no lower layer performs presentation."""
+    """Format one typed service result; no lower layer performs presentation.
+
+    Normal mode prints user-facing utterances.  Inspection mode instead exposes
+    the independent diarization turns and Whisper words, which helps determine
+    whether a bad result came from segmentation, transcription, or alignment.
+    Diagnostics and warnings normally go to stderr so stdout can be redirected
+    as a cleaner transcript stream.
+    """
+
     stdout = stdout or sys.stdout
     stderr = stderr or sys.stderr
+    # Gaps are warnings rather than transcript lines because they describe
+    # missing input, not something a participant said.
     for gap in result.audio_gaps:
         print(
             f"Warning: inference fell behind; skipped "
@@ -54,6 +72,8 @@ def present_result(
         )
 
     if inspect:
+        # Preserve both identifiers: the first is the cross-window session ID;
+        # ``model=`` is Pyannote's temporary label for this particular window.
         for turn in result.speaker_turns:
             print(
                 f"[TURN {timestamp(turn.start)}-{timestamp(turn.end)}] "
@@ -61,6 +81,8 @@ def present_result(
                 file=stdout,
                 flush=True,
             )
+        # Show raw STT independently from speaker turns.  This is especially
+        # useful when speech was transcribed but could not be aligned.
         if result.recognized_words:
             print(
                 f"[STT {timestamp(result.recognized_words[0].start)}-"
@@ -77,6 +99,8 @@ def present_result(
                 flush=True,
             )
     else:
+        # Final utterances are append-only.  Provisional lines describe the
+        # complete current tail and may be replaced on the next update.
         for utterance in result.finalized_utterances:
             _print_utterance(utterance, "FINAL", stdout)
         for utterance in result.provisional_utterances:
@@ -93,6 +117,8 @@ def present_result(
             )
 
     if include_diagnostics:
+        # Counts distinguish local model clusters from tracked session voices.
+        # Timing helps identify when inference is slower than real-time capture.
         diagnostics = result.diagnostics
         details = (
             f"; input RMS {diagnostics.input_rms_dbfs:.0f} dBFS, "
@@ -111,6 +137,8 @@ def present_result(
 
 
 def _print_utterance(utterance: Utterance, label: str, output: TextIO) -> None:
+    """Render one finalized or provisional utterance consistently."""
+
     print(
         f"[{label} {timestamp(utterance.start)}-{timestamp(utterance.end)}] "
         f"{utterance.speaker_id}: {utterance.text}",
@@ -120,6 +148,10 @@ def _print_utterance(utterance: Utterance, label: str, output: TextIO) -> None:
 
 
 def load_service(config: DiarizationConfig) -> DiarizationService:
+    """Load both optional model providers and assemble the core service."""
+
+    # The microphone is validated before this function is called.  That avoids
+    # an expensive model download when the selected input cannot be opened.
     token = _read_hf_token()
     print(f"Loading {config.pyannote_model_name}...", flush=True)
     diarization_provider = load_pyannote_provider(config, token=token)
@@ -134,12 +166,20 @@ def load_service(config: DiarizationConfig) -> DiarizationService:
 
 
 def _read_hf_token() -> str | None:
+    """Read HF_TOKEN from the process environment, then a local .env fallback.
+
+    This tiny reader avoids making python-dotenv a standard dependency.  The
+    token value is passed to the provider loader but is never printed.
+    """
+
+    # Explicit process configuration wins over the repository-local file.
     token = os.environ.get("HF_TOKEN", "").strip()
     if token:
         return token
     env_file = Path(__file__).resolve().parents[2] / ".env"
     if not env_file.exists():
         return None
+    # ``utf-8-sig`` tolerates a BOM written by some Windows editors.
     for line in env_file.read_text(encoding="utf-8-sig").splitlines():
         key, separator, value = line.strip().partition("=")
         if separator and key.strip() == "HF_TOKEN":
@@ -155,8 +195,17 @@ def run_live(
     inspect: bool = False,
     capture_factory: CaptureFactory = MicrophoneCapture,
 ) -> None:
+    """Capture overlapping windows until interrupted, then finalize safely.
+
+    Capture continues in SoundDevice's callback while the main thread performs
+    inference.  ``next_sample`` schedules updates from the monotonic sample
+    count rather than wall time, preventing clock drift between iterations.
+    """
+
     window = round(config.window_seconds * config.sample_rate)
     step = round(config.step_seconds * config.sample_rate)
+    # Remember the last snapshot frontier so shutdown knows whether audio
+    # arrived during the most recent model inference.
     last_processed_total = 0
     with capture_factory(
         sample_rate=config.sample_rate,
@@ -169,12 +218,15 @@ def run_live(
             f"up to {config.max_speakers} speakers. Ctrl+C to stop.",
             flush=True,
         )
+        # Wait for a full initial window.  Later updates need only ``step`` new
+        # samples and therefore overlap earlier audio.
         next_sample = window
         try:
             while True:
                 capture.ensure_healthy()
                 snapshot = capture.snapshot(next_sample)
                 if snapshot is None:
+                    # A short poll keeps Ctrl+C responsive without busy-spinning.
                     time.sleep(0.05)
                     continue
                 result = service.process(snapshot.samples, snapshot.start_seconds)
@@ -182,8 +234,12 @@ def run_live(
                 last_processed_total = snapshot.total_samples
                 next_sample = snapshot.total_samples + step
         except KeyboardInterrupt:
+            # Stop the producer first so the shutdown snapshot has a stable end
+            # and no new audio arrives while it is being finalized.
             capture.stop()
             final_error: Exception | None = None
+            # Model inference can take seconds while capture continues.  Run
+            # one final snapshot if anything arrived after the last update.
             snapshot = capture.snapshot(1)
             if snapshot is not None and snapshot.total_samples > last_processed_total:
                 print("Finalizing newly captured audio...", flush=True)
@@ -192,12 +248,17 @@ def run_live(
                     present_result(result, inspect=inspect)
                 except Exception as exc:
                     final_error = exc
+            # flush() does not rerun either model.  It promotes the service's
+            # already-inferred provisional tail so end-of-session speech is not
+            # silently lost.
             flush_result = service.flush()
             present_result(
                 flush_result,
                 inspect=inspect,
                 include_diagnostics=False,
             )
+            # Always flush even when the last inference fails, then propagate
+            # that error to the outer CLI handler after buffered text is shown.
             if final_error is not None:
                 raise final_error
             raise
@@ -209,6 +270,8 @@ def run_microphone_check(
     sample_rate: int,
     capture_factory: CaptureFactory = MicrophoneCapture,
 ) -> None:
+    """Display ten seconds of input levels without loading either model."""
+
     with capture_factory(
         sample_rate=sample_rate,
         capacity_samples=sample_rate,
@@ -244,12 +307,16 @@ def run_microphone_check(
 
 
 def _levels(snapshot: AudioSnapshot) -> tuple[float, float]:
+    """Return RMS and peak levels in finite dBFS values."""
+
     rms = float(np.sqrt(np.mean(snapshot.samples ** 2)))
     peak = float(np.max(np.abs(snapshot.samples)))
     return 20 * np.log10(max(rms, 1e-12)), 20 * np.log10(max(peak, 1e-12))
 
 
 def _print_devices(devices: tuple[InputDevice, ...]) -> None:
+    """Format device records returned by the capture layer."""
+
     print("Microphone IDs (* = default input):")
     for device in devices:
         print(
@@ -259,6 +326,8 @@ def _print_devices(devices: tuple[InputDevice, ...]) -> None:
 
 
 def _parser() -> argparse.ArgumentParser:
+    """Build the standalone CLI without importing any optional model package."""
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list-devices", action="store_true", help="List microphone IDs; no models needed.")
     parser.add_argument("--device", type=int, help="Input device ID (default: system microphone).")
@@ -287,8 +356,12 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the selected CLI action and translate failures into exit statuses."""
+
     parser = _parser()
     args = parser.parse_args(argv)
+    # Construct configuration before touching hardware or models so invalid
+    # duration relationships fail immediately with argparse's status code.
     try:
         config = DiarizationConfig(
             pyannote_model_name=args.diarization_model,
@@ -302,9 +375,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(exc))
 
     try:
+        # Device listing and level checks deliberately return before service
+        # construction, so they need neither HF credentials nor model packages.
         if args.list_devices:
             _print_devices(list_input_devices())
             return 0
+        # Validate the microphone before the expensive model-loading step.
         microphone_name = validate_input_device(args.device, sample_rate=config.sample_rate)
         print(f"Microphone: {microphone_name}", flush=True)
         if args.check_mic:
@@ -320,6 +396,8 @@ def main(argv: list[str] | None = None) -> int:
         run_live(service, args.device, config, inspect=args.inspect)
         return 0
     except KeyboardInterrupt:
+        # run_live performs final snapshot processing and flush first; this
+        # outer handler converts the expected interrupt into a clean exit.
         print("\nStopped. Microphone closed.", flush=True)
         return 0
     except Exception as exc:

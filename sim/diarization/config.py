@@ -1,4 +1,9 @@
-"""Validated configuration for the standalone diarization service."""
+"""Validated configuration for the standalone diarization service.
+
+Keeping every tuning value here makes model adapters and processing classes
+deterministic and easy to test.  The configuration is frozen so a running
+session cannot silently change thresholds halfway through voice tracking.
+"""
 
 from __future__ import annotations
 
@@ -42,27 +47,54 @@ def _require_finite(
 
 @dataclass(frozen=True)
 class DiarizationConfig:
-    """Models, streaming behavior, and acoustic voice-matching heuristics."""
+    """Models, streaming behavior, and acoustic voice-matching heuristics.
 
+    Similarity values are cosine similarities in the inclusive range [-1, 1].
+    A margin is the difference between the best and second-best profile score;
+    requiring a margin prevents a weak tie from being treated as a confident
+    identity match.
+    """
+
+    # Model and audio settings.  Whisper receives the language explicitly so
+    # it does not spend time auto-detecting the language for every window.
     pyannote_model_name: str = DEFAULT_PYANNOTE_MODEL
     whisper_model_name: str = DEFAULT_WHISPER_MODEL
     language: str = "en"
     sample_rate: int = 16_000
+
+    # Capture is rolling and overlapping.  With the defaults the analyzed
+    # windows are 0-6s, 3-9s, 6-12s, and so on.  The newest three seconds stay
+    # provisional until they appear with more context in the next window.
     window_seconds: float = 6.0
     step_seconds: float = 3.0
     finalization_delay_seconds: float = 3.0
+
+    # These limits describe acoustic clusters, not nurse/patient roles.
     min_speakers: int = 1
     max_speakers: int = 2
     max_voice_profiles: int = 2
+
+    # A local voice must contain enough speech before it may seed or update a
+    # session profile; very short sounds produce unreliable embeddings.
     profile_seed_min_speech_seconds: float = 1.0
+
+    # A low maximum similarity allows a sufficiently different embedding to
+    # create a new profile.  A separate, higher minimum accepts an existing
+    # match.  The intentional gap between them is an uncertainty region.
     new_profile_max_similarity: float = 0.50
     match_min_similarity: float = 0.60
     match_min_margin: float = 0.10
+
+    # Updating a stored voice profile is stricter than merely matching it.
+    # Only five percent of a confident new vector is blended in by default,
+    # which lets profiles adapt slowly without drifting toward another voice.
     profile_update_min_similarity: float = 0.75
     profile_update_min_margin: float = 0.20
     profile_update_weight: float = 0.05
 
     def __post_init__(self) -> None:
+        # Validate related values together here rather than allowing failures
+        # deep inside a model invocation after expensive models have loaded.
         _require_nonempty_string("Pyannote model name", self.pyannote_model_name)
         _require_nonempty_string("Whisper model name", self.whisper_model_name)
         _require_nonempty_string("Language", self.language)
@@ -73,6 +105,9 @@ class DiarizationConfig:
         _require_finite("Finalization delay seconds", self.finalization_delay_seconds, minimum=0)
         if self.step_seconds > self.window_seconds:
             raise ValueError("Step seconds must not exceed window seconds.")
+
+        # Text can only be safely reconsidered while it remains inside the
+        # overlap shared with the next window.
         if self.finalization_delay_seconds > self.window_seconds - self.step_seconds:
             raise ValueError(
                 "Finalization delay seconds must not exceed window seconds minus step seconds."
@@ -111,6 +146,8 @@ class DiarizationConfig:
             minimum_exclusive=True,
         )
 
+        # Preserve a non-overlapping decision order: create, uncertain, match,
+        # and finally (under stricter conditions) update.
         if self.new_profile_max_similarity >= self.match_min_similarity:
             raise ValueError(
                 "New-profile maximum similarity must be below match minimum similarity."

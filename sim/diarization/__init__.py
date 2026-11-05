@@ -1,4 +1,16 @@
-"""Public, dependency-light interfaces for standalone speaker diarization."""
+"""Public, dependency-light interfaces for standalone speaker diarization.
+
+Importing this package is safe from the normal simulation environment: the
+modules below import only the standard library and NumPy.  Torch, Pyannote,
+faster-whisper, and SoundDevice are imported lazily when a caller explicitly
+loads a model or opens a microphone.
+
+The exports are intentionally library-independent wherever possible so the
+service can later be reused by a UI without exposing third-party model types.
+"""
+
+# Re-export the supported public surface here.  Callers should not need to
+# know which internal module owns a model, provider boundary, or helper.
 
 from .config import (
     DEFAULT_PYANNOTE_MODEL,
