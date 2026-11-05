@@ -5,5 +5,7 @@ venv/
 .env
 .DS_Store
 transcripts/
+# Local manual reference transcripts for diarization experiments.
+demos/diarization/references/
 *.pyc
 *.pyo
