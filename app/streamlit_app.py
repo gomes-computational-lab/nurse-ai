@@ -6,7 +6,7 @@ import streamlit as st
 
 from app.voice_turn import voice_turn
 from sim.ollama_client import OllamaClient
-from sim.scenarios import list_scenarios
+from sim.scenarios import load_scenario
 from sim.session import SimulationSession
 from sim.speech_to_text import transcribe_audio
 from sim.storage import save_result
@@ -37,7 +37,7 @@ if saved_message := st.session_state.pop("saved_message", None):
 
 # Choose a scenario and start a conversation.
 if st.session_state.simulation is None:
-    scenarios = list_scenarios()
+    scenarios = [load_scenario("ruth_family_member")]
 
     if not scenarios:
         st.error("No scenarios were found in the scenarios folder.")
