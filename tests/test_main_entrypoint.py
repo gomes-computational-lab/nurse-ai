@@ -52,6 +52,35 @@ class MainEntrypointTests(unittest.TestCase):
             entrypoint.main()
             self.assertIs(sys.argv, original_arguments)
 
+    def test_diarization_forwards_options_and_preserves_exit_status(self) -> None:
+        original_arguments = [
+            "main.py", "--diarization", "--window", "15", "--step", "3",
+        ]
+        arguments_seen: list[str] = []
+
+        def run_diarization() -> int:
+            arguments_seen.extend(sys.argv)
+            return 1
+
+        with (
+            patch.object(sys, "argv", original_arguments),
+            patch("diarization_demo.main", side_effect=run_diarization) as diarization_main,
+        ):
+            self.assertEqual(entrypoint.main(), 1)
+            diarization_main.assert_called_once_with()
+            self.assertIs(sys.argv, original_arguments)
+
+        self.assertEqual(arguments_seen, [
+            "main.py", "--window", "15", "--step", "3",
+        ])
+
+    def test_voice_and_diarization_modes_cannot_be_combined(self) -> None:
+        with (
+            patch.object(sys, "argv", ["main.py", "--voice", "--diarization"]),
+            self.assertRaisesRegex(SystemExit, "Choose either --diarization or --voice"),
+        ):
+            entrypoint.main()
+
 
 if __name__ == "__main__":
     unittest.main()
